@@ -1,7 +1,8 @@
 import os
 import sqlite3
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
@@ -17,6 +18,12 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_FILE = "event_bot.db"
 
 album_cache = {}
+
+
+def now_kst():
+    return datetime.now(
+        timezone(timedelta(hours=9))
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db():
@@ -59,7 +66,7 @@ def save_application(user_id, name, username):
         name,
         username,
         "pending",
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_kst()
     ))
 
     conn.commit()
@@ -87,8 +94,19 @@ def make_admin_caption(user):
         f"이름: {name}\n"
         f"아이디: {username}\n"
         f"고유ID: {user_id}\n"
-        f"신청시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"신청시간: {now_kst()}\n\n"
         "캡처본 확인 후 처리해주세요."
+    )
+
+
+def make_result_text(result, user_id):
+    return (
+        "\n\n━━━━━━━━━━━━━━\n"
+        "✅ 처리결과\n\n"
+        f"상태 : {result}\n"
+        f"고유ID : {user_id}\n"
+        f"처리시간 : {now_kst()}\n"
+        "━━━━━━━━━━━━━━"
     )
 
 
@@ -139,6 +157,58 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_text)
 
 
+async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today_date = now_kst().split(" ")[0]
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM applications WHERE created_at LIKE ?",
+        (f"{today_date}%",)
+    )
+    count = cur.fetchone()[0]
+    conn.close()
+
+    await update.message.reply_text(
+        f"📊 오늘 신청자 수\n\n{today_date} 기준: {count}명"
+    )
+
+
+async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("관리자만 확인할 수 있습니다.")
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name, username, user_id, created_at
+        FROM applications
+        WHERE status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 20
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("승인 대기 중인 신청자가 없습니다.")
+        return
+
+    text = "📋 승인 대기 목록\n\n"
+
+    for name, username, user_id, created_at in rows:
+        text += (
+            f"이름: {name}\n"
+            f"아이디: {username}\n"
+            f"고유ID: {user_id}\n"
+            f"신청시간: {created_at}\n"
+            "──────────────\n"
+        )
+
+    await update.message.reply_text(text)
+
+
 async def check_user_before_submit(message, user):
     if ADMIN_ID == 0:
         await message.reply_text("관리자 설정이 아직 완료되지 않았습니다.")
@@ -148,6 +218,10 @@ async def check_user_before_submit(message, user):
 
     if current_status == "approved":
         await message.reply_text("이미 이벤트 참여가 완료되었습니다.")
+        return False
+
+    if current_status == "pending":
+        await message.reply_text("이미 신청이 접수되어 관리자 확인 대기 중입니다.")
         return False
 
     if current_status == "blocked":
@@ -218,7 +292,10 @@ async def process_album_group(context: ContextTypes.DEFAULT_TYPE, media_group_id
 
     await context.bot.send_message(
         chat_id=ADMIN_ID,
-        text=f"위 신청을 처리하세요.\n고유ID: {user.id}",
+        text=(
+            "📎 위 사진 묶음 신청을 처리하세요.\n\n"
+            f"고유ID: {user.id}"
+        ),
         reply_markup=make_keyboard(user.id)
     )
 
@@ -308,7 +385,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=user_id,
             text="✅ 이벤트 참여가 완료되었습니다."
         )
-        result = "✅ 승인 완료"
+        result = "승인 완료"
 
     elif action == "reject":
         update_status(user_id, "rejected")
@@ -316,7 +393,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=user_id,
             text="❌ 이벤트 참여가 반려되었습니다.\n조건 확인 후 다시 제출해주세요."
         )
-        result = "❌ 거절 완료"
+        result = "거절 완료"
 
     elif action == "block":
         update_status(user_id, "blocked")
@@ -324,24 +401,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=user_id,
             text="🚫 이벤트 신청이 제한되었습니다."
         )
-        result = "🚫 차단 완료"
+        result = "차단 완료"
 
     else:
         return
 
-    result_text = f"처리결과: {result}\n고유ID: {user_id}"
+    result_text = make_result_text(result, user_id)
 
     try:
         if query.message.caption:
             await query.edit_message_caption(
-                caption=f"{query.message.caption}\n\n{result_text}",
+                caption=f"{query.message.caption}{result_text}",
                 reply_markup=None
             )
+
         elif query.message.text:
             await query.edit_message_text(
-                text=f"{query.message.text}\n\n{result_text}",
+                text=f"{query.message.text}{result_text}",
                 reply_markup=None
             )
+
         else:
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(result_text)
@@ -371,6 +450,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("list", list_pending))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
