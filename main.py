@@ -82,8 +82,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🎉 신사소통방 이벤트 참여봇입니다.\n\n"
         "아래 조건 중 하나를 충족한 캡처본을 보내주세요.\n\n"
-        "✅ 당일 누적 채팅 500개 이상\n"
-        "✅ 제휴사 5만원 이상 이용내역\n\n"
+        "✅ 당일 누적 채팅 300개 이상\n"
+        "✅ 제휴사 3만원 이상 이용내역\n\n"
         "📌 캡처본을 보내주시면 관리자 확인 후 안내드립니다."
     )
     await update.message.reply_text(text)
