@@ -1,7 +1,8 @@
 import os
 import sqlite3
+import asyncio
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -14,6 +15,8 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_FILE = "event_bot.db"
+
+album_cache = {}
 
 
 def init_db():
@@ -37,10 +40,8 @@ def init_db():
 def get_application(user_id):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-
     cur.execute("SELECT status FROM applications WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
-
     conn.close()
     return row[0] if row else None
 
@@ -68,14 +69,39 @@ def save_application(user_id, name, username):
 def update_status(user_id, status):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-
     cur.execute(
         "UPDATE applications SET status = ? WHERE user_id = ?",
         (status, user_id)
     )
-
     conn.commit()
     conn.close()
+
+
+def make_admin_caption(user):
+    username = f"@{user.username}" if user.username else "없음"
+    name = user.full_name
+    user_id = user.id
+
+    return (
+        "📩 이벤트 참여 신청\n\n"
+        f"이름: {name}\n"
+        f"아이디: {username}\n"
+        f"고유ID: {user_id}\n"
+        f"신청시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        "캡처본 확인 후 처리해주세요."
+    )
+
+
+def make_keyboard(user_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ 승인", callback_data=f"approve:{user_id}"),
+            InlineKeyboardButton("❌ 거절", callback_data=f"reject:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("🚫 차단", callback_data=f"block:{user_id}")
+        ]
+    ])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -84,7 +110,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "아래 조건 중 하나를 충족한 캡처본을 보내주세요.\n\n"
         "✅ 당일 누적 채팅 300개 이상\n"
         "✅ 제휴사 3만원 이상 이용내역\n\n"
-        "📌 캡처본을 보내주시면 관리자 확인 후 안내드립니다."
+        "📌 사진은 여러 장을 한 번에 보내도 됩니다.\n"
+        "📌 관리자 확인 후 참여 완료 안내를 드립니다."
     )
     await update.message.reply_text(text)
 
@@ -96,8 +123,7 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    current_status = get_application(user_id)
+    current_status = get_application(update.effective_user.id)
 
     if not current_status:
         await update.message.reply_text("아직 이벤트 신청 내역이 없습니다.")
@@ -113,68 +139,147 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_text)
 
 
-async def handle_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.message
-
+async def check_user_before_submit(message, user):
     if ADMIN_ID == 0:
         await message.reply_text("관리자 설정이 아직 완료되지 않았습니다.")
-        return
+        return False
 
     current_status = get_application(user.id)
 
     if current_status == "approved":
         await message.reply_text("이미 이벤트 참여가 완료되었습니다.")
-        return
+        return False
 
     if current_status == "blocked":
         await message.reply_text("신청이 제한된 상태입니다.")
+        return False
+
+    return True
+
+
+async def handle_single_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.message
+
+    if not await check_user_before_submit(message, user):
         return
 
-    username = f"@{user.username}" if user.username else "없음"
-    name = user.full_name
-    user_id = user.id
-
-    save_application(user_id, name, username)
-
-    caption = (
-        "📩 이벤트 참여 신청\n\n"
-        f"이름: {name}\n"
-        f"아이디: {username}\n"
-        f"고유ID: {user_id}\n"
-        f"신청시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        "캡처본 확인 후 처리해주세요."
+    save_application(
+        user.id,
+        user.full_name,
+        f"@{user.username}" if user.username else "없음"
     )
 
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ 승인", callback_data=f"approve:{user_id}"),
-            InlineKeyboardButton("❌ 거절", callback_data=f"reject:{user_id}"),
-        ],
-        [
-            InlineKeyboardButton("🚫 차단", callback_data=f"block:{user_id}")
-        ]
-    ]
+    file_id = message.photo[-1].file_id
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    await context.bot.send_photo(
+        chat_id=ADMIN_ID,
+        photo=file_id,
+        caption=make_admin_caption(user),
+        reply_markup=make_keyboard(user.id)
+    )
 
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        await context.bot.send_photo(
-            chat_id=ADMIN_ID,
-            photo=file_id,
-            caption=caption,
-            reply_markup=reply_markup
+    await message.reply_text(
+        "📨 이벤트 참여 신청이 접수되었습니다.\n"
+        "관리자 확인 후 결과를 안내드리겠습니다."
+    )
+
+
+async def process_album_group(context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
+    await asyncio.sleep(1.5)
+
+    data = album_cache.pop(media_group_id, None)
+    if not data:
+        return
+
+    user = data["user"]
+    chat_id = data["chat_id"]
+    photos = data["photos"]
+
+    save_application(
+        user.id,
+        user.full_name,
+        f"@{user.username}" if user.username else "없음"
+    )
+
+    media = []
+    caption = make_admin_caption(user)
+
+    for index, file_id in enumerate(photos):
+        if index == 0:
+            media.append(InputMediaPhoto(media=file_id, caption=caption))
+        else:
+            media.append(InputMediaPhoto(media=file_id))
+
+    await context.bot.send_media_group(
+        chat_id=ADMIN_ID,
+        media=media
+    )
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"위 신청을 처리하세요.\n고유ID: {user.id}",
+        reply_markup=make_keyboard(user.id)
+    )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📨 이벤트 참여 신청이 접수되었습니다.\n"
+            f"사진 {len(photos)}장이 관리자에게 전달되었습니다.\n"
+            "관리자 확인 후 결과를 안내드리겠습니다."
         )
+    )
 
-    elif message.document:
-        file_id = message.document.file_id
-        await context.bot.send_document(
-            chat_id=ADMIN_ID,
-            document=file_id,
-            caption=caption,
-            reply_markup=reply_markup
-        )
+
+async def handle_album_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.message
+
+    if not await check_user_before_submit(message, user):
+        return
+
+    media_group_id = message.media_group_id
+    file_id = message.photo[-1].file_id
+
+    if media_group_id not in album_cache:
+        album_cache[media_group_id] = {
+            "user": user,
+            "chat_id": message.chat_id,
+            "photos": []
+        }
+
+        asyncio.create_task(process_album_group(context, media_group_id))
+
+    album_cache[media_group_id]["photos"].append(file_id)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.media_group_id:
+        await handle_album_photo(update, context)
+    else:
+        await handle_single_photo(update, context)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.message
+
+    if not await check_user_before_submit(message, user):
+        return
+
+    save_application(
+        user.id,
+        user.full_name,
+        f"@{user.username}" if user.username else "없음"
+    )
+
+    await context.bot.send_document(
+        chat_id=ADMIN_ID,
+        document=message.document.file_id,
+        caption=make_admin_caption(user),
+        reply_markup=make_keyboard(user.id)
+    )
 
     await message.reply_text(
         "📨 이벤트 참여 신청이 접수되었습니다.\n"
@@ -220,9 +325,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
-    old_caption = query.message.caption or ""
-    await query.edit_message_caption(
-        caption=old_caption + f"\n\n처리결과: {result}"
+    await query.edit_message_text(
+        text=f"처리결과: {result}\n고유ID: {user_id}"
     )
 
 
@@ -230,7 +334,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "캡처본 이미지를 보내주세요.\n\n"
         "✅ 당일 누적 채팅 300개 이상\n"
-        "✅ 제휴사 3만원 이상 이용내역"
+        "✅ 제휴사 3만원 이상 이용내역\n\n"
+        "사진 여러 장을 한 번에 보내도 됩니다."
     )
 
 
@@ -246,8 +351,8 @@ def main():
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("status", status))
 
-    app.add_handler(MessageHandler(filters.PHOTO, handle_submit))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_submit))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_handler(CallbackQueryHandler(handle_callback))
