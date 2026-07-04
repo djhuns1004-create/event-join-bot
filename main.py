@@ -289,6 +289,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
+    if not query:
+        return
+
     await query.answer()
 
     if query.from_user.id != ADMIN_ID:
@@ -325,9 +329,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
 
-    await query.edit_message_text(
-        text=f"처리결과: {result}\n고유ID: {user_id}"
-    )
+    result_text = f"처리결과: {result}\n고유ID: {user_id}"
+
+    try:
+        if query.message.caption:
+            await query.edit_message_caption(
+                caption=f"{query.message.caption}\n\n{result_text}",
+                reply_markup=None
+            )
+        elif query.message.text:
+            await query.edit_message_text(
+                text=f"{query.message.text}\n\n{result_text}",
+                reply_markup=None
+            )
+        else:
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text(result_text)
+
+    except Exception as e:
+        print(f"메시지 수정 실패: {e}")
+        await query.message.reply_text(result_text)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
