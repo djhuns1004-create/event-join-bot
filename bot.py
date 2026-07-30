@@ -326,6 +326,11 @@ def get_event(event_id: int) -> Optional[sqlite3.Row]:
 
 
 def get_active_event() -> Optional[sqlite3.Row]:
+    events = get_active_events()
+    return events[0] if events else None
+
+
+def get_active_events() -> list[sqlite3.Row]:
     with db_connect() as conn:
         return conn.execute(
             """
@@ -333,9 +338,27 @@ def get_active_event() -> Optional[sqlite3.Row]:
             FROM events
             WHERE status = 'active'
             ORDER BY id DESC
-            LIMIT 1
             """
-        ).fetchone()
+        ).fetchall()
+
+
+def get_all_events() -> list[sqlite3.Row]:
+    with db_connect() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM events
+            WHERE status != 'deleted'
+            ORDER BY
+                CASE status
+                    WHEN 'active' THEN 0
+                    WHEN 'draft' THEN 1
+                    WHEN 'ended' THEN 2
+                    ELSE 3
+                END,
+                id DESC
+            """
+        ).fetchall()
 
 
 def get_latest_event() -> Optional[sqlite3.Row]:
@@ -430,19 +453,8 @@ def start_event(event_id: int) -> None:
         conn.execute(
             """
             UPDATE events
-            SET status = 'ended',
-                ended_at = ?,
-                updated_at = ?
-            WHERE status = 'active' AND id != ?
-            """,
-            (now_kst(), now_kst(), event_id),
-        )
-
-        conn.execute(
-            """
-            UPDATE events
             SET status = 'active',
-                started_at = ?,
+                started_at = COALESCE(started_at, ?),
                 ended_at = NULL,
                 updated_at = ?
             WHERE id = ?
@@ -532,80 +544,75 @@ def no_event_card() -> str:
 
 def member_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📨 참여 신청",
-                callback_data=f"user:apply:{event_id}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📋 내 신청 상태",
-                callback_data="user:status",
-            )
-        ],
+        [InlineKeyboardButton("📨 이 이벤트 참여", callback_data=f"user:apply:{event_id}")],
+        [InlineKeyboardButton("⬅ 진행 이벤트 목록", callback_data="user:event_list")],
+        [InlineKeyboardButton("📋 내 신청 상태", callback_data="user:status")],
     ])
+
+
+def member_event_list_keyboard(events: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            f"🎉 {(event['title'] or f'이벤트 #{event['id']}')[:30]}",
+            callback_data=f"user:event:{event['id']}",
+        )]
+        for event in events
+    ]
+    rows.append([InlineKeyboardButton("📋 내 신청 상태", callback_data="user:status")])
+    return InlineKeyboardMarkup(rows)
 
 
 def member_no_event_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📋 내 신청 상태",
-                callback_data="user:status",
-            )
-        ]
+        [InlineKeyboardButton("📋 내 신청 상태", callback_data="user:status")]
     ])
+
+
+def active_events_card(events: list[sqlite3.Row]) -> str:
+    if not events:
+        return no_event_card()
+
+    lines = [
+        "<b>🎉 진행 중인 이벤트</b>",
+        "",
+        CARD_LINE,
+        "",
+        "참여할 이벤트를 아래 버튼에서 선택해주세요.",
+        "",
+    ]
+    for index, event in enumerate(events, 1):
+        lines.append(f"{index}. {event_title_html(event)}")
+    lines.extend(["", CARD_LINE])
+    return "\\n".join(lines)
 
 
 def admin_home_keyboard() -> InlineKeyboardMarkup:
-    latest = get_latest_event()
-    active = get_active_event()
-
-    rows = [
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ 이벤트 새로 등록", callback_data="admin:new_event")],
+        [InlineKeyboardButton("📚 전체 이벤트 관리", callback_data="admin:event_list")],
         [
-            InlineKeyboardButton(
-                "➕ 이벤트 새로 등록",
-                callback_data="admin:new_event",
-            )
-        ]
-    ]
-
-    if latest:
-        rows.append([
-            InlineKeyboardButton(
-                "📝 이벤트 관리",
-                callback_data=f"event:manage:{latest['id']}",
-            )
-        ])
-
-    if active:
-        rows.append([
-            InlineKeyboardButton(
-                "🛑 현재 이벤트 종료",
-                callback_data=f"event:end:{active['id']}",
-            )
-        ])
-
-    rows.extend([
-        [
-            InlineKeyboardButton(
-                "📋 승인 대기",
-                callback_data="admin:pending",
-            ),
-            InlineKeyboardButton(
-                "📊 신청 현황",
-                callback_data="admin:stats",
-            ),
+            InlineKeyboardButton("📋 전체 승인 대기", callback_data="admin:pending"),
+            InlineKeyboardButton("📊 전체 신청 현황", callback_data="admin:stats"),
         ],
-        [
-            InlineKeyboardButton(
-                "❌ 관리자 메뉴 닫기",
-                callback_data="admin:close",
-            )
-        ],
+        [InlineKeyboardButton("❌ 관리자 메뉴 닫기", callback_data="admin:close")],
     ])
 
+
+def admin_event_list_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for event in get_all_events():
+        status_icon = {"active": "🟢", "draft": "⚪", "ended": "🔴"}.get(
+            event["status"], "▫️"
+        )
+        rows.append([
+            InlineKeyboardButton(
+                f"{status_icon} #{event['id']} {event['title'][:24]}",
+                callback_data=f"event:manage:{event['id']}",
+            )
+        ])
+
+    rows.append([InlineKeyboardButton("➕ 이벤트 새로 등록", callback_data="admin:new_event")])
+    rows.append([InlineKeyboardButton("⬅ 관리자 메뉴", callback_data="admin:home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -642,6 +649,16 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
                 "👀 미리보기",
                 callback_data=f"event:preview:{event['id']}",
             )
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 이 이벤트 승인 대기",
+                callback_data=f"event:pending:{event['id']}",
+            ),
+            InlineKeyboardButton(
+                "📊 이 이벤트 현황",
+                callback_data=f"event:stats:{event['id']}",
+            ),
         ],
     ]
 
@@ -932,9 +949,9 @@ async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    event = get_active_event()
+    events = get_active_events()
 
-    if not event:
+    if not events:
         await update.effective_message.reply_text(
             no_event_card(),
             parse_mode=ParseMode.HTML,
@@ -943,9 +960,9 @@ async def start_command(
         return
 
     await update.effective_message.reply_text(
-        event_card(event),
+        active_events_card(events),
         parse_mode=ParseMode.HTML,
-        reply_markup=member_event_keyboard(event["id"]),
+        reply_markup=member_event_list_keyboard(events),
     )
 
 
@@ -974,7 +991,7 @@ async def ping_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     await update.effective_message.reply_text(
-        "✅ 신사 이벤트 참여봇 V6.1 정상 작동 중"
+        "✅ 신사 이벤트 참여봇 V7 정상 작동 중"
     )
 
 
@@ -1003,9 +1020,22 @@ async def photo_handler(
     )
 
     if not application_id:
+        with db_connect() as conn:
+            collecting = conn.execute(
+                """
+                SELECT id
+                FROM applications_v6
+                WHERE user_id = ? AND status = 'collecting'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (user.id,),
+            ).fetchone()
+        application_id = collecting["id"] if collecting else None
+
+    if not application_id:
         await message.reply_text(
-            "먼저 이벤트 화면에서 `참여 신청` 버튼을 눌러주세요.",
-            parse_mode=ParseMode.MARKDOWN,
+            "먼저 진행 중인 이벤트를 선택하고 참여 신청 버튼을 눌러주세요."
         )
         return
 
@@ -1105,84 +1135,95 @@ async def send_application_to_admin(
     )
 
 
-async def send_pending(message) -> None:
+async def send_pending(
+    message,
+    event_id: Optional[int] = None,
+) -> None:
     with db_connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM applications_v6
-            WHERE status = 'pending'
-            ORDER BY id DESC
-            LIMIT 50
-            """
-        ).fetchall()
+        if event_id is None:
+            rows = conn.execute(
+                """
+                SELECT * FROM applications_v6
+                WHERE status = 'pending'
+                ORDER BY id DESC LIMIT 50
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM applications_v6
+                WHERE status = 'pending' AND event_id = ?
+                ORDER BY id DESC LIMIT 50
+                """,
+                (event_id,),
+            ).fetchall()
+
+    event = get_event(event_id) if event_id else None
+    back = event_manage_keyboard(event) if event else admin_home_keyboard()
 
     if not rows:
-        await message.reply_text(
-            "📭 승인 대기 신청이 없습니다.",
-            reply_markup=admin_home_keyboard(),
-        )
+        await message.reply_text("📭 승인 대기 신청이 없습니다.", reply_markup=back)
         return
 
-    lines = ["📋 <b>승인 대기 목록</b>\n"]
-
+    lines = ["📋 <b>승인 대기 목록</b>\\n"]
     for row in rows:
         lines.append(
-            f"📌 #{row['id']} / "
-            f"{html.escape(row['event_title'])}\n"
-            f"👤 {html.escape(row['name'] or '-')}\n"
-            f"🆔 <code>{row['user_id']}</code>\n"
-            f"📸 {application_photo_count(row['id'])}장\n"
+            f"📌 #{row['id']} / {html.escape(row['event_title'])}\\n"
+            f"👤 {html.escape(row['name'] or '-')}\\n"
+            f"🆔 <code>{row['user_id']}</code>\\n"
+            f"📸 {application_photo_count(row['id'])}장\\n"
             "──────────────"
         )
 
     await message.reply_text(
-        "\n".join(lines)[:4000],
+        "\\n".join(lines)[:4000],
         parse_mode=ParseMode.HTML,
-        reply_markup=admin_home_keyboard(),
+        reply_markup=back,
     )
 
 
-async def send_stats(message) -> None:
-    active = get_active_event()
-
-    if not active:
-        await message.reply_text(
-            "📭 현재 진행 중인 이벤트가 없습니다.",
-            reply_markup=admin_home_keyboard(),
-        )
-        return
+async def send_stats(
+    message,
+    event_id: Optional[int] = None,
+) -> None:
+    event = get_event(event_id) if event_id else None
 
     with db_connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT status, COUNT(*) AS count
-            FROM applications_v6
-            WHERE event_id = ?
-            GROUP BY status
-            """,
-            (active["id"],),
-        ).fetchall()
+        if event_id is None:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM applications_v6 GROUP BY status"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM applications_v6
+                WHERE event_id = ?
+                GROUP BY status
+                """,
+                (event_id,),
+            ).fetchall()
 
     counts = {
         "collecting": 0,
         "pending": 0,
         "approved": 0,
         "rejected": 0,
+        "notify_failed": 0,
     }
-
     for row in rows:
         counts[row["status"]] = row["count"]
 
     await message.reply_text(
-        "📊 <b>이벤트 신청 현황</b>\n\n"
-        f"🎉 {event_title_html(active)}\n\n"
-        f"📸 사진 등록 중 : {counts['collecting']}건\n"
-        f"⏳ 승인 대기 : {counts['pending']}건\n"
-        f"✅ 승인 : {counts['approved']}건\n"
-        f"❌ 거절 : {counts['rejected']}건",
+        "📊 <b>이벤트 신청 현황</b>\\n\\n"
+        f"🎉 {event_title_html(event) if event else '전체 이벤트'}\\n\\n"
+        f"📸 사진 등록 중 : {counts['collecting']}건\\n"
+        f"⏳ 승인 대기 : {counts['pending']}건\\n"
+        f"✅ 승인 : {counts['approved']}건\\n"
+        f"❌ 거절 : {counts['rejected']}건\\n"
+        f"⚠️ 전달 실패 : {counts['notify_failed']}건",
         parse_mode=ParseMode.HTML,
-        reply_markup=admin_home_keyboard(),
+        reply_markup=event_manage_keyboard(event) if event else admin_home_keyboard(),
     )
 
 
@@ -1214,18 +1255,46 @@ async def callback_handler_impl(
                     )
                 ),
                 parse_mode=ParseMode.HTML,
+                reply_markup=member_no_event_keyboard(),
+            )
+            return
+
+        if action == "event_list":
+            events = get_active_events()
+            await query.edit_message_text(
+                active_events_card(events),
+                parse_mode=ParseMode.HTML,
+                reply_markup=(
+                    member_event_list_keyboard(events)
+                    if events else member_no_event_keyboard()
+                ),
+            )
+            return
+
+        if action == "event":
+            event_id = int(parts[2])
+            event = get_event(event_id)
+
+            if not event or event["status"] != "active":
+                await query.answer(
+                    "현재 진행 중인 이벤트가 아닙니다.",
+                    show_alert=True,
+                )
+                return
+
+            await query.edit_message_text(
+                event_card(event),
+                parse_mode=ParseMode.HTML,
+                reply_markup=member_event_keyboard(event_id),
             )
             return
 
         if action == "apply":
             event_id = int(parts[2])
             event = get_event(event_id)
-            active = get_active_event()
-
             if (
                 not event
-                or not active
-                or active["id"] != event_id
+                or event["status"] != "active"
             ):
                 await query.message.reply_text(
                     no_event_card(),
@@ -1371,6 +1440,15 @@ async def callback_handler_impl(
         )
         return
 
+    if data == "admin:event_list":
+        await query.edit_message_text(
+            "📚 <b>전체 이벤트 관리</b>\n\n"
+            "관리할 이벤트를 선택해주세요.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_event_list_keyboard(),
+        )
+        return
+
     if data == "admin:new_event":
         event_id = create_event()
         event = get_event(event_id)
@@ -1400,6 +1478,14 @@ async def callback_handler_impl(
                 "이벤트를 찾을 수 없습니다.",
                 reply_markup=admin_home_keyboard(),
             )
+            return
+
+        if action == "pending":
+            await send_pending(query.message, event_id)
+            return
+
+        if action == "stats":
+            await send_stats(query.message, event_id)
             return
 
         if action == "manage":
@@ -1639,13 +1725,13 @@ async def text_handler(
             )
             return
 
-    event = get_active_event()
+    events = get_active_events()
 
-    if event:
+    if events:
         await message.reply_text(
-            event_card(event),
+            active_events_card(events),
             parse_mode=ParseMode.HTML,
-            reply_markup=member_event_keyboard(event["id"]),
+            reply_markup=member_event_list_keyboard(events),
         )
     else:
         await message.reply_text(
@@ -1702,7 +1788,7 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info(
-        "신사 이벤트 참여봇 V6.1 FIX 실행 | ADMIN_ID=%s | DB=%s",
+        "신사 이벤트 참여봇 V7 MULTI 실행 | ADMIN_ID=%s | DB=%s",
         ADMIN_ID,
         DB_FILE,
     )
