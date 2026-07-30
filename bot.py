@@ -68,8 +68,22 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
+def ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    columns = table_columns(conn, table)
+    if column not in columns:
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
+
+
 def init_db() -> None:
     with db_connect() as conn:
+        # 기존 V5 events 테이블이 있어도 새 컬럼을 자동으로 추가합니다.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,12 +98,75 @@ def init_db() -> None:
                 rejection_text TEXT NOT NULL DEFAULT '',
                 rejection_html TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'draft',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
                 started_at TEXT,
                 ended_at TEXT,
                 deleted_at TEXT
             )
+        """)
+
+        event_columns = (
+            ("title", "TEXT NOT NULL DEFAULT ''"),
+            ("title_html", "TEXT NOT NULL DEFAULT ''"),
+            ("participation_time", "TEXT NOT NULL DEFAULT ''"),
+            ("participation_time_html", "TEXT NOT NULL DEFAULT ''"),
+            ("conditions", "TEXT NOT NULL DEFAULT ''"),
+            ("conditions_html", "TEXT NOT NULL DEFAULT ''"),
+            ("approval_text", "TEXT NOT NULL DEFAULT ''"),
+            ("approval_html", "TEXT NOT NULL DEFAULT ''"),
+            ("rejection_text", "TEXT NOT NULL DEFAULT ''"),
+            ("rejection_html", "TEXT NOT NULL DEFAULT ''"),
+            ("status", "TEXT NOT NULL DEFAULT 'draft'"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ("started_at", "TEXT"),
+            ("ended_at", "TEXT"),
+            ("deleted_at", "TEXT"),
+        )
+
+        for column, definition in event_columns:
+            ensure_column(conn, "events", column, definition)
+
+        # V5 데이터를 V6 표시용 HTML 컬럼으로 자동 보완합니다.
+        conn.execute("""
+            UPDATE events
+            SET title_html = CASE
+                    WHEN title_html IS NULL OR title_html = ''
+                    THEN COALESCE(title, '')
+                    ELSE title_html
+                END,
+                participation_time_html = CASE
+                    WHEN participation_time_html IS NULL
+                         OR participation_time_html = ''
+                    THEN COALESCE(participation_time, '')
+                    ELSE participation_time_html
+                END,
+                conditions_html = CASE
+                    WHEN conditions_html IS NULL OR conditions_html = ''
+                    THEN COALESCE(conditions, '')
+                    ELSE conditions_html
+                END,
+                approval_text = CASE
+                    WHEN approval_text IS NULL OR approval_text = ''
+                    THEN '✅ 참가승인이 되었습니다.'
+                    ELSE approval_text
+                END,
+                approval_html = CASE
+                    WHEN approval_html IS NULL OR approval_html = ''
+                    THEN '✅ 참가승인이 되었습니다.'
+                    ELSE approval_html
+                END,
+                rejection_text = CASE
+                    WHEN rejection_text IS NULL OR rejection_text = ''
+                    THEN '❌ 참가신청이 거절되었습니다.'
+                    ELSE rejection_text
+                END,
+                rejection_html = CASE
+                    WHEN rejection_html IS NULL OR rejection_html = ''
+                    THEN '❌ 참가신청이 거절되었습니다.'
+                    ELSE rejection_html
+                END
         """)
 
         conn.execute("""
@@ -109,6 +186,28 @@ def init_db() -> None:
             )
         """)
 
+        application_columns = (
+            ("event_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("event_title", "TEXT NOT NULL DEFAULT ''"),
+            ("user_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("name", "TEXT"),
+            ("username", "TEXT"),
+            ("status", "TEXT NOT NULL DEFAULT 'collecting'"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ("submitted_at", "TEXT"),
+            ("processed_at", "TEXT"),
+            ("processed_by", "INTEGER"),
+            ("admin_notified", "INTEGER NOT NULL DEFAULT 0"),
+        )
+
+        for column, definition in application_columns:
+            ensure_column(
+                conn,
+                "applications_v6",
+                column,
+                definition,
+            )
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS application_photos_v6 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,6 +216,20 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             )
         """)
+
+        photo_columns = (
+            ("application_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("file_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        )
+
+        for column, definition in photo_columns:
+            ensure_column(
+                conn,
+                "application_photos_v6",
+                column,
+                definition,
+            )
 
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_v6_event_user
@@ -861,7 +974,7 @@ async def ping_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     await update.effective_message.reply_text(
-        "✅ 신사 이벤트 참여봇 V6 정상 작동 중"
+        "✅ 신사 이벤트 참여봇 V6.1 정상 작동 중"
     )
 
 
@@ -1073,7 +1186,7 @@ async def send_stats(message) -> None:
     )
 
 
-async def callback_handler(
+async def callback_handler_impl(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
@@ -1449,6 +1562,46 @@ async def callback_handler(
         return
 
 
+async def callback_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+
+    try:
+        await callback_handler_impl(update, context)
+
+    except Exception as exc:
+        logger.exception(
+            "버튼 처리 오류 callback_data=%s",
+            query.data if query else None,
+        )
+
+        if query:
+            try:
+                await query.answer(
+                    "버튼 처리 중 오류가 발생했습니다.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+
+            try:
+                await query.message.reply_text(
+                    "⚠️ 버튼 처리 중 오류가 발생했습니다.\n\n"
+                    f"오류 종류: <code>{html.escape(type(exc).__name__)}</code>\n"
+                    "Railway 로그에서 자세한 내용을 확인해주세요.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=(
+                        admin_home_keyboard()
+                        if is_admin(query.from_user.id)
+                        else None
+                    ),
+                )
+            except Exception:
+                pass
+
+
 async def text_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1549,7 +1702,7 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info(
-        "신사 이벤트 참여봇 V6 실행 | ADMIN_ID=%s | DB=%s",
+        "신사 이벤트 참여봇 V6.1 FIX 실행 | ADMIN_ID=%s | DB=%s",
         ADMIN_ID,
         DB_FILE,
     )
