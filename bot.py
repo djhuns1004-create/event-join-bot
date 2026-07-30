@@ -112,6 +112,7 @@ def init_db() -> None:
             ("content_html", "TEXT NOT NULL DEFAULT ''"),
             ("deadline_at", "TEXT NOT NULL DEFAULT ''"),
             ("emoji_title", "TEXT NOT NULL DEFAULT ''"),
+            ("emoji_title_id", "TEXT NOT NULL DEFAULT ''"),
             ("emoji_content", "TEXT NOT NULL DEFAULT ''"),
             ("emoji_time", "TEXT NOT NULL DEFAULT ''"),
             ("emoji_deadline", "TEXT NOT NULL DEFAULT ''"),
@@ -187,6 +188,30 @@ def init_db() -> None:
                 END
         """)
 
+        # 기존 HTML에 저장된 제목 프리미엄 이모지 ID를 자동 추출합니다.
+        rows = conn.execute(
+            """
+            SELECT id, emoji_title, emoji_title_id
+            FROM events
+            """
+        ).fetchall()
+
+        for row in rows:
+            if not row["emoji_title_id"]:
+                custom_id = extract_custom_emoji_id_from_html(
+                    row["emoji_title"] or ""
+                )
+                if custom_id:
+                    conn.execute(
+                        """
+                        UPDATE events
+                        SET emoji_title_id = ?
+                        WHERE id = ?
+                        """,
+                        (custom_id, row["id"]),
+                    )
+
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS applications_v6 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,6 +262,13 @@ def init_db() -> None:
             """
             INSERT OR IGNORE INTO settings_v8(key, value)
             VALUES ('status_button_emoji', '')
+            """
+        )
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO settings_v8(key, value)
+            VALUES ('status_button_emoji_id', '')
             """
         )
 
@@ -363,20 +395,56 @@ def set_v8_setting(key: str, value: str) -> None:
         )
 
 
+def extract_custom_emoji_id_from_html(value: str) -> str:
+    match = re.search(
+        r'<tg-emoji\s+emoji-id="([^"]+)"',
+        value or "",
+    )
+    return match.group(1) if match else ""
+
+
+def extract_custom_emoji_id_from_message(message) -> str:
+    for entity in message.entities or []:
+        if (
+            str(entity.type) == "custom_emoji"
+            and entity.custom_emoji_id
+        ):
+            return entity.custom_emoji_id
+    return ""
+
+
 def button_emoji_from_html(value: str) -> str:
     value = value or ""
-
-    if "<tg-emoji" in value:
-        value = re.sub(
-            r"<tg-emoji[^>]*>.*?</tg-emoji>",
-            "",
-            value,
-            flags=re.DOTALL,
-        )
-
+    value = re.sub(
+        r"<tg-emoji[^>]*>.*?</tg-emoji>",
+        "",
+        value,
+        flags=re.DOTALL,
+    )
     value = re.sub(r"<[^>]+>", "", value)
     value = html.unescape(value).strip()
     return value[:4]
+
+
+def premium_button(
+    text: str,
+    callback_data: str,
+    custom_emoji_id: str = "",
+    fallback_emoji: str = "",
+) -> InlineKeyboardButton:
+    """
+    Bot API의 icon_custom_emoji_id를 사용합니다.
+    PTB가 필드를 직접 지원하며, api_kwargs는 하위 호환용입니다.
+    """
+    kwargs = {
+        "text": button_label(fallback_emoji, text),
+        "callback_data": callback_data,
+    }
+
+    if custom_emoji_id:
+        kwargs["icon_custom_emoji_id"] = custom_emoji_id
+
+    return InlineKeyboardButton(**kwargs)
 
 
 def button_label(prefix: str, text: str) -> str:
@@ -534,6 +602,7 @@ def update_event_emoji(
     event_id: int,
     field: str,
     html_value: str,
+    custom_emoji_id: str = "",
 ) -> None:
     column_map = {
         "emoji_title": "emoji_title",
@@ -548,10 +617,27 @@ def update_event_emoji(
         raise ValueError("수정할 수 없는 이모지 항목입니다.")
 
     with db_connect() as conn:
-        conn.execute(
-            f"UPDATE events SET {column} = ?, updated_at = ? WHERE id = ?",
-            (html_value, now_kst(), event_id),
-        )
+        if field == "emoji_title":
+            conn.execute(
+                """
+                UPDATE events
+                SET emoji_title = ?,
+                    emoji_title_id = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    html_value,
+                    custom_emoji_id,
+                    now_kst(),
+                    event_id,
+                ),
+            )
+        else:
+            conn.execute(
+                f"UPDATE events SET {column} = ?, updated_at = ? WHERE id = ?",
+                (html_value, now_kst(), event_id),
+            )
 
 
 def update_event_deadline(event_id: int, value: str) -> None:
@@ -728,7 +814,14 @@ def no_event_card() -> str:
 
 
 def member_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
-    status_prefix = get_v8_setting("status_button_emoji", "")
+    status_custom_id = get_v8_setting(
+        "status_button_emoji_id",
+        "",
+    )
+    status_fallback = get_v8_setting(
+        "status_button_emoji",
+        "",
+    )
 
     return InlineKeyboardMarkup([
         [
@@ -744,9 +837,11 @@ def member_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
             )
         ],
         [
-            InlineKeyboardButton(
-                button_label(status_prefix, "내 신청 상태"),
+            premium_button(
+                "내 신청 상태",
                 callback_data="user:status",
+                custom_emoji_id=status_custom_id,
+                fallback_emoji=status_fallback,
             )
         ],
     ])
@@ -759,21 +854,40 @@ def member_event_list_keyboard(
 
     for event in events:
         title = event["title"] or f"이벤트 #{event['id']}"
-        prefix = button_emoji_from_html(event["emoji_title"] or "")
+        custom_id = (
+            event["emoji_title_id"]
+            or extract_custom_emoji_id_from_html(
+                event["emoji_title"] or ""
+            )
+        )
+        fallback = button_emoji_from_html(
+            event["emoji_title"] or ""
+        )
 
         rows.append([
-            InlineKeyboardButton(
-                button_label(prefix, title[:30]),
+            premium_button(
+                title[:30],
                 callback_data=f"user:event:{event['id']}",
+                custom_emoji_id=custom_id,
+                fallback_emoji=fallback,
             )
         ])
 
-    status_prefix = get_v8_setting("status_button_emoji", "")
+    status_custom_id = get_v8_setting(
+        "status_button_emoji_id",
+        "",
+    )
+    status_fallback = get_v8_setting(
+        "status_button_emoji",
+        "",
+    )
 
     rows.append([
-        InlineKeyboardButton(
-            button_label(status_prefix, "내 신청 상태"),
+        premium_button(
+            "내 신청 상태",
             callback_data="user:status",
+            custom_emoji_id=status_custom_id,
+            fallback_emoji=status_fallback,
         )
     ])
 
@@ -781,13 +895,22 @@ def member_event_list_keyboard(
 
 
 def member_no_event_keyboard() -> InlineKeyboardMarkup:
-    status_prefix = get_v8_setting("status_button_emoji", "")
+    status_custom_id = get_v8_setting(
+        "status_button_emoji_id",
+        "",
+    )
+    status_fallback = get_v8_setting(
+        "status_button_emoji",
+        "",
+    )
 
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                button_label(status_prefix, "내 신청 상태"),
+            premium_button(
+                "내 신청 상태",
                 callback_data="user:status",
+                custom_emoji_id=status_custom_id,
+                fallback_emoji=status_fallback,
             )
         ]
     ])
@@ -1276,7 +1399,7 @@ async def ping_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     await update.effective_message.reply_text(
-        "✅ 신사 이벤트 참여봇 V8.1 정상 작동 중"
+        "✅ 신사 이벤트 참여봇 V8.2 정상 작동 중"
     )
 
 
@@ -1736,7 +1859,7 @@ async def callback_handler_impl(
             "버튼 앞에 표시할 일반 이모지 하나를 보내주세요.\n"
             "제거하려면 <code>없음</code>이라고 입력하세요.\n\n"
             f"현재 설정: {html.escape(current or '없음')}\n\n"
-            "프리미엄 커스텀 이모지는 버튼에서 지원되지 않습니다.",
+            "일반 이모지와 프리미엄 커스텀 이모지를 모두 등록할 수 있습니다.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [
@@ -2091,19 +2214,28 @@ async def text_handler(
 
             if value == "없음":
                 emoji_value = ""
+                custom_emoji_id = ""
             else:
                 rich_value = message_to_html(message)
+                custom_emoji_id = extract_custom_emoji_id_from_message(
+                    message
+                )
+                emoji_value = button_emoji_from_html(rich_value)
 
-                if "<tg-emoji" in rich_value:
+                if not custom_emoji_id and not emoji_value:
                     await message.reply_text(
-                        "프리미엄 커스텀 이모지는 버튼에 표시할 수 없습니다.\n"
-                        "일반 이모지를 보내주세요."
+                        "일반 이모지 또는 프리미엄 이모지를 보내주세요."
                     )
                     return
 
-                emoji_value = plain_from_html(rich_value).strip()[:4]
-
-            set_v8_setting("status_button_emoji", emoji_value)
+            set_v8_setting(
+                "status_button_emoji",
+                emoji_value,
+            )
+            set_v8_setting(
+                "status_button_emoji_id",
+                custom_emoji_id,
+            )
             context.user_data.clear()
 
             await message.reply_text(
@@ -2154,16 +2286,20 @@ async def text_handler(
         if emoji_event_id and emoji_field:
             value = (message.text or "").strip()
 
-            html_value = (
-                ""
-                if value == "없음"
-                else message_to_html(message)
-            )
+            if value == "없음":
+                html_value = ""
+                custom_emoji_id = ""
+            else:
+                html_value = message_to_html(message)
+                custom_emoji_id = extract_custom_emoji_id_from_message(
+                    message
+                )
 
             update_event_emoji(
                 emoji_event_id,
                 emoji_field,
                 html_value,
+                custom_emoji_id=custom_emoji_id,
             )
 
             context.user_data.clear()
@@ -2266,7 +2402,7 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info(
-        "신사 이벤트 참여봇 V8.1 CLEAN BUTTON 실행 | ADMIN_ID=%s | DB=%s",
+        "신사 이벤트 참여봇 V8.2 PREMIUM BUTTON 실행 | ADMIN_ID=%s | DB=%s",
         ADMIN_ID,
         DB_FILE,
     )
