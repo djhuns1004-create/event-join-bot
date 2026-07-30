@@ -227,6 +227,20 @@ def init_db() -> None:
             )
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings_v8 (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            )
+        """)
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO settings_v8(key, value)
+            VALUES ('status_button_emoji', '')
+            """
+        )
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS application_photos_v6 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 application_id INTEGER NOT NULL,
@@ -326,6 +340,48 @@ def message_to_html(message) -> str:
     )
     return "".join(result)
 
+
+
+def get_v8_setting(key: str, default: str = "") -> str:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings_v8 WHERE key = ?",
+            (key,),
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def set_v8_setting(key: str, value: str) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO settings_v8(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+
+def button_emoji_from_html(value: str) -> str:
+    value = value or ""
+
+    if "<tg-emoji" in value:
+        value = re.sub(
+            r"<tg-emoji[^>]*>.*?</tg-emoji>",
+            "",
+            value,
+            flags=re.DOTALL,
+        )
+
+    value = re.sub(r"<[^>]+>", "", value)
+    value = html.unescape(value).strip()
+    return value[:4]
+
+
+def button_label(prefix: str, text: str) -> str:
+    prefix = (prefix or "").strip()
+    return f"{prefix} {text}".strip()
 
 def is_admin(user_id: int) -> bool:
     return ADMIN_ID != 0 and user_id == ADMIN_ID
@@ -672,28 +728,68 @@ def no_event_card() -> str:
 
 
 def member_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
+    status_prefix = get_v8_setting("status_button_emoji", "")
+
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📨 이 이벤트 참여", callback_data=f"user:apply:{event_id}")],
-        [InlineKeyboardButton("⬅ 진행 이벤트 목록", callback_data="user:event_list")],
-        [InlineKeyboardButton("📋 내 신청 상태", callback_data="user:status")],
+        [
+            InlineKeyboardButton(
+                "이 이벤트 참여",
+                callback_data=f"user:apply:{event_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅ 진행 이벤트 목록",
+                callback_data="user:event_list",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                button_label(status_prefix, "내 신청 상태"),
+                callback_data="user:status",
+            )
+        ],
     ])
 
 
-def member_event_list_keyboard(events: list[sqlite3.Row]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(
-            f"🎉 {(event['title'] or f'이벤트 #{event['id']}')[:30]}",
-            callback_data=f"user:event:{event['id']}",
-        )]
-        for event in events
-    ]
-    rows.append([InlineKeyboardButton("📋 내 신청 상태", callback_data="user:status")])
+def member_event_list_keyboard(
+    events: list[sqlite3.Row],
+) -> InlineKeyboardMarkup:
+    rows = []
+
+    for event in events:
+        title = event["title"] or f"이벤트 #{event['id']}"
+        prefix = button_emoji_from_html(event["emoji_title"] or "")
+
+        rows.append([
+            InlineKeyboardButton(
+                button_label(prefix, title[:30]),
+                callback_data=f"user:event:{event['id']}",
+            )
+        ])
+
+    status_prefix = get_v8_setting("status_button_emoji", "")
+
+    rows.append([
+        InlineKeyboardButton(
+            button_label(status_prefix, "내 신청 상태"),
+            callback_data="user:status",
+        )
+    ])
+
     return InlineKeyboardMarkup(rows)
 
 
 def member_no_event_keyboard() -> InlineKeyboardMarkup:
+    status_prefix = get_v8_setting("status_button_emoji", "")
+
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 내 신청 상태", callback_data="user:status")]
+        [
+            InlineKeyboardButton(
+                button_label(status_prefix, "내 신청 상태"),
+                callback_data="user:status",
+            )
+        ]
     ])
 
 
@@ -701,18 +797,7 @@ def active_events_card(events: list[sqlite3.Row]) -> str:
     if not events:
         return no_event_card()
 
-    lines = [
-        "<b>🎉 진행 중인 이벤트</b>",
-        "",
-        CARD_LINE,
-        "",
-        "참여할 이벤트를 아래 버튼에서 선택해주세요.",
-        "",
-    ]
-    for index, event in enumerate(events, 1):
-        lines.append(f"{index}. {event_title_html(event)}")
-    lines.extend(["", CARD_LINE])
-    return "\\n".join(lines)
+    return "<b>진행 중인 이벤트를 선택해주세요.</b>"
 
 
 def admin_home_keyboard() -> InlineKeyboardMarkup:
@@ -722,6 +807,12 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("📋 전체 승인 대기", callback_data="admin:pending"),
             InlineKeyboardButton("📊 전체 신청 현황", callback_data="admin:stats"),
+        ],
+        [
+            InlineKeyboardButton(
+                "내 신청상태 버튼 이모지",
+                callback_data="admin:status_emoji",
+            )
         ],
         [InlineKeyboardButton("❌ 관리자 메뉴 닫기", callback_data="admin:close")],
     ])
@@ -1185,7 +1276,7 @@ async def ping_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     await update.effective_message.reply_text(
-        "✅ 신사 이벤트 참여봇 V8 정상 작동 중"
+        "✅ 신사 이벤트 참여봇 V8.1 정상 작동 중"
     )
 
 
@@ -1370,7 +1461,7 @@ async def send_pending(
         )
 
     await message.reply_text(
-        "\\n".join(lines)[:4000],
+        "\n".join(lines)[:4000],
         parse_mode=ParseMode.HTML,
         reply_markup=back,
     )
@@ -1631,6 +1722,30 @@ async def callback_handler_impl(
         context.user_data.clear()
         await query.edit_message_text(
             "관리자 메뉴를 닫았습니다."
+        )
+        return
+
+    if data == "admin:status_emoji":
+        context.user_data.clear()
+        context.user_data["edit_status_button_emoji"] = True
+
+        current = get_v8_setting("status_button_emoji", "")
+
+        await query.edit_message_text(
+            "<b>내 신청 상태 버튼 이모지</b>\n\n"
+            "버튼 앞에 표시할 일반 이모지 하나를 보내주세요.\n"
+            "제거하려면 <code>없음</code>이라고 입력하세요.\n\n"
+            f"현재 설정: {html.escape(current or '없음')}\n\n"
+            "프리미엄 커스텀 이모지는 버튼에서 지원되지 않습니다.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "⬅ 관리자 메뉴",
+                        callback_data="admin:home",
+                    )
+                ]
+            ]),
         )
         return
 
@@ -1971,6 +2086,32 @@ async def text_handler(
     user = update.effective_user
 
     if is_admin(user.id):
+        if context.user_data.get("edit_status_button_emoji"):
+            value = (message.text or "").strip()
+
+            if value == "없음":
+                emoji_value = ""
+            else:
+                rich_value = message_to_html(message)
+
+                if "<tg-emoji" in rich_value:
+                    await message.reply_text(
+                        "프리미엄 커스텀 이모지는 버튼에 표시할 수 없습니다.\n"
+                        "일반 이모지를 보내주세요."
+                    )
+                    return
+
+                emoji_value = plain_from_html(rich_value).strip()[:4]
+
+            set_v8_setting("status_button_emoji", emoji_value)
+            context.user_data.clear()
+
+            await message.reply_text(
+                "내 신청 상태 버튼 이모지를 저장했습니다.",
+                reply_markup=admin_home_keyboard(),
+            )
+            return
+
         deadline_event_id = context.user_data.get(
             "edit_deadline_event_id"
         )
@@ -2125,7 +2266,7 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info(
-        "신사 이벤트 참여봇 V8 DEADLINE EMOJI 실행 | ADMIN_ID=%s | DB=%s",
+        "신사 이벤트 참여봇 V8.1 CLEAN BUTTON 실행 | ADMIN_ID=%s | DB=%s",
         ADMIN_ID,
         DB_FILE,
     )
