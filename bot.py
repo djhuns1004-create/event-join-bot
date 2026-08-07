@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V14 MANUAL ONOFF
+# 신사 이벤트 참여봇 V14.1 APPLICATION UI CLEAN
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -54,7 +54,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v14_manual_onoff")
+logger = logging.getLogger("sinsa_event_bot_v14_1_application_ui_clean")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -1640,7 +1640,6 @@ async def send_application_to_admin(context: ContextTypes.DEFAULT_TYPE, applicat
                 "<b>이벤트 참가 신청</b>\n"
                 f"{CARD_LINE}\n\n"
                 f"<b>{field_prefix(event,'emoji_title')}{html.escape(application['event_title'])}</b>\n\n"
-                f"신청번호 : <code>#{application['id']}</code>\n"
                 f"회원 : {html.escape(application['name'] or '이름 없음')}\n"
                 f"아이디 : {html.escape(application['username'] or '없음')}\n"
                 f"회원 ID : <code>{application['user_id']}</code>\n"
@@ -1659,7 +1658,7 @@ async def send_application_to_admin(context: ContextTypes.DEFAULT_TYPE, applicat
     await context.bot.send_media_group(chat_id=ADMIN_ID, media=media)
     await context.bot.send_message(
         chat_id=ADMIN_ID,
-        text=f"<b>신청 #{application['id']} 처리</b>",
+        text="<b>신청 확인</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_application_keyboard(application["id"]),
     )
@@ -1784,7 +1783,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             return
         set_application_status(application_id, "pending")
         context.user_data.pop("collecting_application_id", None)
-        await query.edit_message_text(f"📨 <b>참가 신청이 접수되었습니다.</b>\n\n신청번호 : <code>#{application_id}</code>\n인증사진 : {len(photos)}장\n\n관리자 확인 후 결과를 안내드립니다.", parse_mode=ParseMode.HTML)
+        await query.edit_message_text(f"<b>참가 신청이 접수되었습니다.</b>\n\n인증사진 : {len(photos)}장\n\n관리자 확인 후 결과를 안내드립니다.", parse_mode=ParseMode.HTML)
         return
 
     # ---------------- 관리자 ----------------
@@ -2160,14 +2159,13 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
 
             await query.edit_message_text(
                 f"참가 승인 완료\n\n"
-                f"신청번호 : #{application_id}\n"
                 f"회원 ID : {approw['user_id']}\n"
                 f"처리시간 : {now_kst()}"
             )
             return
 
         await query.edit_message_text(
-            f"신청 #{application_id} 거절 사유를 선택해주세요.",
+            "거절 사유를 선택해주세요.",
             reply_markup=reject_reason_keyboard(application_id),
         )
         return
@@ -2179,7 +2177,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data.clear(); context.user_data["reject_custom_id"] = application_id
             await query.edit_message_text("거절 사유를 직접 입력해주세요."); return
         await finish_reject(context, application_id, REJECT_REASONS.get(reason_key, "관리자 확인 결과 거절되었습니다."), query.from_user.id)
-        await query.edit_message_text(f"❌ 참가 거절 완료\n\n신청번호 : #{application_id}\n사유 : {REJECT_REASONS.get(reason_key,'')}"); return
+        await query.edit_message_text(f"참가 거절 완료\n\n사유 : {REJECT_REASONS.get(reason_key,'')}"); return
 
 
 async def finish_reject(context: ContextTypes.DEFAULT_TYPE, application_id: int, reason: str, admin_id: int) -> None:
@@ -2354,7 +2352,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V14 MANUAL ONOFF 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V14.1 APPLICATION UI CLEAN 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
