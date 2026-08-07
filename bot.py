@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V14.1 APPLICATION UI CLEAN
+# 신사 이벤트 참여봇 V15 FINAL CONTROL
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -54,7 +54,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v14_1_application_ui_clean")
+logger = logging.getLogger("sinsa_event_bot_v15_final_control")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -988,30 +988,45 @@ def emoji_event_select_keyboard() -> InlineKeyboardMarkup:
 def admin_event_list_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for event in get_all_events()[:50]:
-        title = (event["title"] or "제목 없음")[:30]
+        title = (event["title"] or "제목 없음")[:24]
+        mode = int(event["manual_mode"] or 0)
+
+        # 실제 진행중이면 OFF 버튼, 그 외는 ON 버튼
+        is_on = event["status"] == "active" and mode != 2
+        toggle_text = "OFF" if is_on else "ON"
+        toggle_action = "off" if is_on else "on"
+
         rows.append([
             InlineKeyboardButton(
                 title,
                 callback_data=f"event:manage:{event['id']}",
-            )
+            ),
+            InlineKeyboardButton(
+                toggle_text,
+                callback_data=f"event_toggle:{toggle_action}:{event['id']}",
+            ),
         ])
+
     rows.append([InlineKeyboardButton("이벤트 새로 등록", callback_data="admin:new_event")])
     rows.append([InlineKeyboardButton("관리자 메뉴", callback_data="admin:home")])
     return InlineKeyboardMarkup(rows)
 
 
 def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
-    manual_mode = int(event["manual_mode"] or 0)
-
-    if manual_mode == 1 and event["status"] == "active":
-        toggle_text = "이벤트 OFF"
-        toggle_data = f"event_toggle:off:{event['id']}"
-    else:
-        toggle_text = "이벤트 ON"
-        toggle_data = f"event_toggle:on:{event['id']}"
+    mode = int(event["manual_mode"] or 0)
+    is_on = event["status"] == "active" and mode != 2
 
     rows = [
-        [InlineKeyboardButton(toggle_text, callback_data=toggle_data)],
+        [
+            InlineKeyboardButton(
+                "ON",
+                callback_data=f"event_toggle:on:{event['id']}",
+            ),
+            InlineKeyboardButton(
+                "OFF",
+                callback_data=f"event_toggle:off:{event['id']}",
+            ),
+        ],
         [
             InlineKeyboardButton("이벤트명", callback_data=f"edit:title:{event['id']}"),
             InlineKeyboardButton("이벤트 내용", callback_data=f"edit:content:{event['id']}")
@@ -1038,7 +1053,7 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
         ],
     ]
 
-    if event["status"] != "active":
+    if not is_on:
         rows.append([InlineKeyboardButton("이벤트 삭제", callback_data=f"event:delete_confirm:{event['id']}")])
 
     rows.append([InlineKeyboardButton("전체 이벤트", callback_data="admin:event_list")])
@@ -1800,7 +1815,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("관리자 메뉴를 닫았습니다.")
         return
     if data == "admin:event_list":
-        await query.edit_message_text("📚 <b>전체 이벤트 관리</b>\n\n관리할 이벤트를 선택해주세요.", parse_mode=ParseMode.HTML, reply_markup=admin_event_list_keyboard())
+        await query.edit_message_text("<b>전체 이벤트 관리</b>\n\n관리할 이벤트를 선택해주세요.", parse_mode=ParseMode.HTML, reply_markup=admin_event_list_keyboard())
         return
     if data == "admin:new_event":
         event_id = create_event()
@@ -1897,7 +1912,6 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         if action == "on":
-            # 예약시간보다 일찍 즉시 시작 가능
             set_event_field(event_id, "manual_mode", 1)
             set_event_field(event_id, "start_announced", 0)
             set_event_field(event_id, "end_announced", 0)
@@ -1907,27 +1921,37 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             set_event_field(event_id, "end_notice_message_type", "")
             start_event(event_id, manual=False)
 
-            ok, msg = await send_group_notice(context.application, event_id, "start", manual=True)
+            ok, msg = await send_group_notice(
+                context.application,
+                event_id,
+                "start",
+                manual=True,
+            )
             event = get_event(event_id)
 
-            if ok:
+            # 전체 목록에서 눌렀으면 목록을 그대로 갱신
+            if query.message and "전체 이벤트 관리" in (query.message.text or ""):
                 await query.edit_message_text(
-                    event_card(event, admin=True) + "\n\n이벤트를 바로 시작했습니다.",
+                    "<b>전체 이벤트 관리</b>\n\n관리할 이벤트를 선택해주세요.",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=event_manage_keyboard(event),
+                    reply_markup=admin_event_list_keyboard(),
                 )
-            else:
-                await query.edit_message_text(
-                    event_card(event, admin=True) +
-                    "\n\n이벤트는 시작됐지만 그룹 공지 전송에 실패했습니다.\n" +
-                    html.escape(msg),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=event_manage_keyboard(event),
-                )
+                if not ok:
+                    await query.answer("이벤트는 시작됐지만 그룹 공지는 실패했습니다.", show_alert=True)
+                return
+
+            suffix = "\n\n이벤트를 바로 시작했습니다."
+            if not ok:
+                suffix += "\n그룹 공지 전송 실패: " + html.escape(msg)
+
+            await query.edit_message_text(
+                event_card(event, admin=True) + suffix,
+                parse_mode=ParseMode.HTML,
+                reply_markup=event_manage_keyboard(event),
+            )
             return
 
         if action == "off":
-            # 수동 종료 후 예약시간이 와도 자동 재시작하지 않음
             set_event_field(event_id, "manual_mode", 2)
             set_event_field(event_id, "end_announced", 0)
             set_event_field(event_id, "end_notice_message_id", 0)
@@ -1936,24 +1960,35 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
 
             event = get_event(event_id)
             await disable_start_notice_button(context.application, event)
-            ok, msg = await send_group_notice(context.application, event_id, "end", manual=True)
+            ok, msg = await send_group_notice(
+                context.application,
+                event_id,
+                "end",
+                manual=True,
+            )
             event = get_event(event_id)
 
-            if ok:
+            if query.message and "전체 이벤트 관리" in (query.message.text or ""):
                 await query.edit_message_text(
-                    event_card(event, admin=True) + "\n\n이벤트를 종료했습니다.",
+                    "<b>전체 이벤트 관리</b>\n\n관리할 이벤트를 선택해주세요.",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=event_manage_keyboard(event),
+                    reply_markup=admin_event_list_keyboard(),
                 )
-            else:
-                await query.edit_message_text(
-                    event_card(event, admin=True) +
-                    "\n\n이벤트는 종료됐지만 그룹 종료공지 전송에 실패했습니다.\n" +
-                    html.escape(msg),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=event_manage_keyboard(event),
-                )
+                if not ok:
+                    await query.answer("이벤트는 종료됐지만 그룹 종료공지는 실패했습니다.", show_alert=True)
+                return
+
+            suffix = "\n\n이벤트를 종료했습니다."
+            if not ok:
+                suffix += "\n그룹 종료공지 전송 실패: " + html.escape(msg)
+
+            await query.edit_message_text(
+                event_card(event, admin=True) + suffix,
+                parse_mode=ParseMode.HTML,
+                reply_markup=event_manage_keyboard(event),
+            )
             return
+
 
     if data.startswith("event:"):
         _, action, event_id_text = data.split(":")
@@ -2352,7 +2387,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V14.1 APPLICATION UI CLEAN 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V15 FINAL CONTROL 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
