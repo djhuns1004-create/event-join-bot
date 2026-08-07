@@ -1,10 +1,11 @@
-
+import asyncio
+import html
+import logging
 import os
 import re
-import html
 import sqlite3
-import logging
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 
 from telegram import (
@@ -13,20 +14,35 @@ from telegram import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
 )
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.constants import ChatType, ParseMode
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
+# =========================================================
+# 신사 이벤트 참여봇 V9.3
+# - 기존 V8 계열 DB 자동 보완
+# - 여러 이벤트
+# - KST 자동 시작/마감
+# - 그룹 시작/마감 공지
+# - 즉시 그룹 공지
+# - 대표 사진/GIF
+# - 인증방식: 당일채팅 / 당일제휴 / 둘 다 허용
+# - 인증사진 1~10장
+# - 승인/거절 + 거절사유
+# - 프리미엄 이모지(이벤트 카드/목록 버튼) 유지
+# =========================================================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
-DB_FILE = os.getenv("DB_FILE", "/data/event_bot.db").strip()
+DB_FILE = os.getenv("DB_FILE", os.getenv("DB_PATH", "/data/event_bot.db")).strip()
 
 KST = timezone(timedelta(hours=9))
 CARD_LINE = "━━━━━━━━━━━━━━"
@@ -35,7 +51,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v6")
+logger = logging.getLogger("sinsa_event_bot_v9_3")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -43,60 +59,75 @@ STATUS_TEXT = {
     "approved": "✅ 참가 승인",
     "rejected": "❌ 참가 거절",
     "notify_failed": "⚠️ 관리자 전달 실패",
+    "cancelled": "🚫 신청 취소",
+}
+
+PROOF_TEXT = {
+    "chat": "당일 채팅기록 인증",
+    "partner": "당일 제휴 이용내역 인증",
+}
+
+REJECT_REASONS = {
+    "photo": "인증사진 확인이 어렵습니다.",
+    "date": "당일 기록을 확인할 수 없습니다.",
+    "condition": "이벤트 참여조건 미달입니다.",
+    "duplicate": "중복 신청으로 확인되었습니다.",
 }
 
 
+def now_dt() -> datetime:
+    return datetime.now(KST)
+
+
 def now_kst() -> str:
-    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    return now_dt().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def db_connect() -> sqlite3.Connection:
     folder = os.path.dirname(DB_FILE)
     if folder:
         os.makedirs(folder, exist_ok=True)
-
     conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {
-        row["name"]
-        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-    }
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
-def ensure_column(
-    conn: sqlite3.Connection,
-    table: str,
-    column: str,
-    definition: str,
-) -> None:
-    columns = table_columns(conn, table)
-    if column not in columns:
-        conn.execute(
-            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        )
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    if column not in table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db() -> None:
+    """기존 V8 DB가 있어도 삭제하지 않고 필요한 컬럼만 추가합니다."""
     with db_connect() as conn:
-        # 기존 V5 events 테이블이 있어도 새 컬럼을 자동으로 추가합니다.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL DEFAULT '',
                 title_html TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                content_html TEXT NOT NULL DEFAULT '',
                 participation_time TEXT NOT NULL DEFAULT '',
                 participation_time_html TEXT NOT NULL DEFAULT '',
+                deadline_at TEXT NOT NULL DEFAULT '',
                 conditions TEXT NOT NULL DEFAULT '',
                 conditions_html TEXT NOT NULL DEFAULT '',
                 approval_text TEXT NOT NULL DEFAULT '',
                 approval_html TEXT NOT NULL DEFAULT '',
                 rejection_text TEXT NOT NULL DEFAULT '',
                 rejection_html TEXT NOT NULL DEFAULT '',
+                emoji_title TEXT NOT NULL DEFAULT '',
+                emoji_title_id TEXT NOT NULL DEFAULT '',
+                emoji_content TEXT NOT NULL DEFAULT '',
+                emoji_time TEXT NOT NULL DEFAULT '',
+                emoji_deadline TEXT NOT NULL DEFAULT '',
+                emoji_conditions TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'draft',
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT '',
@@ -108,109 +139,43 @@ def init_db() -> None:
 
         event_columns = (
             ("title", "TEXT NOT NULL DEFAULT ''"),
+            ("title_html", "TEXT NOT NULL DEFAULT ''"),
             ("content", "TEXT NOT NULL DEFAULT ''"),
             ("content_html", "TEXT NOT NULL DEFAULT ''"),
-            ("deadline_at", "TEXT NOT NULL DEFAULT ''"),
-            ("emoji_title", "TEXT NOT NULL DEFAULT ''"),
-            ("emoji_title_id", "TEXT NOT NULL DEFAULT ''"),
-            ("emoji_content", "TEXT NOT NULL DEFAULT ''"),
-            ("emoji_time", "TEXT NOT NULL DEFAULT ''"),
-            ("emoji_deadline", "TEXT NOT NULL DEFAULT ''"),
-            ("emoji_conditions", "TEXT NOT NULL DEFAULT ''"),
-            ("title_html", "TEXT NOT NULL DEFAULT ''"),
             ("participation_time", "TEXT NOT NULL DEFAULT ''"),
             ("participation_time_html", "TEXT NOT NULL DEFAULT ''"),
+            ("deadline_at", "TEXT NOT NULL DEFAULT ''"),
             ("conditions", "TEXT NOT NULL DEFAULT ''"),
             ("conditions_html", "TEXT NOT NULL DEFAULT ''"),
             ("approval_text", "TEXT NOT NULL DEFAULT ''"),
             ("approval_html", "TEXT NOT NULL DEFAULT ''"),
             ("rejection_text", "TEXT NOT NULL DEFAULT ''"),
             ("rejection_html", "TEXT NOT NULL DEFAULT ''"),
+            ("emoji_title", "TEXT NOT NULL DEFAULT ''"),
+            ("emoji_title_id", "TEXT NOT NULL DEFAULT ''"),
+            ("emoji_content", "TEXT NOT NULL DEFAULT ''"),
+            ("emoji_time", "TEXT NOT NULL DEFAULT ''"),
+            ("emoji_deadline", "TEXT NOT NULL DEFAULT ''"),
+            ("emoji_conditions", "TEXT NOT NULL DEFAULT ''"),
             ("status", "TEXT NOT NULL DEFAULT 'draft'"),
             ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ("started_at", "TEXT"),
             ("ended_at", "TEXT"),
             ("deleted_at", "TEXT"),
+            # V9 추가
+            ("start_at", "TEXT NOT NULL DEFAULT ''"),
+            ("proof_mode", "TEXT NOT NULL DEFAULT 'both'"),
+            ("max_photos", "INTEGER NOT NULL DEFAULT 10"),
+            ("media_file_id", "TEXT NOT NULL DEFAULT ''"),
+            ("media_type", "TEXT NOT NULL DEFAULT ''"),
+            ("announce_start", "INTEGER NOT NULL DEFAULT 1"),
+            ("announce_end", "INTEGER NOT NULL DEFAULT 1"),
+            ("start_announced", "INTEGER NOT NULL DEFAULT 0"),
+            ("end_announced", "INTEGER NOT NULL DEFAULT 0"),
         )
-
         for column, definition in event_columns:
             ensure_column(conn, "events", column, definition)
-
-        # V5 데이터를 V6 표시용 HTML 컬럼으로 자동 보완합니다.
-        conn.execute("""
-            UPDATE events
-            SET content = CASE
-                    WHEN content IS NULL OR content = ''
-                    THEN '이벤트 내용을 입력해주세요.'
-                    ELSE content
-                END,
-                content_html = CASE
-                    WHEN content_html IS NULL OR content_html = ''
-                    THEN COALESCE(content, '이벤트 내용을 입력해주세요.')
-                    ELSE content_html
-                END,
-                title_html = CASE
-                    WHEN title_html IS NULL OR title_html = ''
-                    THEN COALESCE(title, '')
-                    ELSE title_html
-                END,
-                participation_time_html = CASE
-                    WHEN participation_time_html IS NULL
-                         OR participation_time_html = ''
-                    THEN COALESCE(participation_time, '')
-                    ELSE participation_time_html
-                END,
-                conditions_html = CASE
-                    WHEN conditions_html IS NULL OR conditions_html = ''
-                    THEN COALESCE(conditions, '')
-                    ELSE conditions_html
-                END,
-                approval_text = CASE
-                    WHEN approval_text IS NULL OR approval_text = ''
-                    THEN '✅ 참가승인이 되었습니다.'
-                    ELSE approval_text
-                END,
-                approval_html = CASE
-                    WHEN approval_html IS NULL OR approval_html = ''
-                    THEN '✅ 참가승인이 되었습니다.'
-                    ELSE approval_html
-                END,
-                rejection_text = CASE
-                    WHEN rejection_text IS NULL OR rejection_text = ''
-                    THEN '❌ 참가신청이 거절되었습니다.'
-                    ELSE rejection_text
-                END,
-                rejection_html = CASE
-                    WHEN rejection_html IS NULL OR rejection_html = ''
-                    THEN '❌ 참가신청이 거절되었습니다.'
-                    ELSE rejection_html
-                END
-        """)
-
-        # 기존 HTML에 저장된 제목 프리미엄 이모지 ID를 자동 추출합니다.
-        rows = conn.execute(
-            """
-            SELECT id, emoji_title, emoji_title_id
-            FROM events
-            """
-        ).fetchall()
-
-        for row in rows:
-            if not row["emoji_title_id"]:
-                custom_id = extract_custom_emoji_id_from_html(
-                    row["emoji_title"] or ""
-                )
-                if custom_id:
-                    conn.execute(
-                        """
-                        UPDATE events
-                        SET emoji_title_id = ?
-                        WHERE id = ?
-                        """,
-                        (custom_id, row["id"]),
-                    )
-
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS applications_v6 (
@@ -228,8 +193,7 @@ def init_db() -> None:
                 admin_notified INTEGER NOT NULL DEFAULT 0
             )
         """)
-
-        application_columns = (
+        for column, definition in (
             ("event_id", "INTEGER NOT NULL DEFAULT 0"),
             ("event_title", "TEXT NOT NULL DEFAULT ''"),
             ("user_id", "INTEGER NOT NULL DEFAULT 0"),
@@ -241,36 +205,10 @@ def init_db() -> None:
             ("processed_at", "TEXT"),
             ("processed_by", "INTEGER"),
             ("admin_notified", "INTEGER NOT NULL DEFAULT 0"),
-        )
-
-        for column, definition in application_columns:
-            ensure_column(
-                conn,
-                "applications_v6",
-                column,
-                definition,
-            )
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS settings_v8 (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL DEFAULT ''
-            )
-        """)
-
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO settings_v8(key, value)
-            VALUES ('status_button_emoji', '')
-            """
-        )
-
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO settings_v8(key, value)
-            VALUES ('status_button_emoji_id', '')
-            """
-        )
+            ("proof_type", "TEXT NOT NULL DEFAULT ''"),
+            ("reject_reason", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            ensure_column(conn, "applications_v6", column, definition)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS application_photos_v6 (
@@ -281,33 +219,52 @@ def init_db() -> None:
             )
         """)
 
-        photo_columns = (
-            ("application_id", "INTEGER NOT NULL DEFAULT 0"),
-            ("file_id", "TEXT NOT NULL DEFAULT ''"),
-            ("created_at", "TEXT NOT NULL DEFAULT ''"),
-        )
-
-        for column, definition in photo_columns:
-            ensure_column(
-                conn,
-                "application_photos_v6",
-                column,
-                definition,
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings_v8 (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
             )
-
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_v6_event_user
-            ON applications_v6(event_id, user_id, id DESC)
         """)
 
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_v6_status
-            ON applications_v6(status, id DESC)
-        """)
+        defaults = {
+            "status_button_emoji": "",
+            "status_button_emoji_id": "",
+            "group_id": "",
+            "group_title": "",
+            "group_start_notice_enabled": "1",
+            "group_end_notice_enabled": "1",
+            "group_start_text": "",
+            "group_end_text": "",
+        }
+        for k, v in defaults.items():
+            conn.execute("INSERT OR IGNORE INTO settings_v8(key,value) VALUES (?,?)", (k, v))
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v9_event_user ON applications_v6(event_id,user_id,id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v9_status ON applications_v6(status,id DESC)")
+        conn.commit()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with db_connect() as conn:
+        row = conn.execute("SELECT value FROM settings_v8 WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO settings_v8(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        conn.commit()
+
+
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 
 def plain_from_html(value: str) -> str:
-    value = re.sub(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", r"\1", value)
+    value = re.sub(r"<tg-emoji[^>]*>(.*?)</tg-emoji>", r"\1", value or "")
     value = re.sub(r"<[^>]+>", "", value)
     return html.unescape(value)
 
@@ -315,2102 +272,1161 @@ def plain_from_html(value: str) -> str:
 def message_to_html(message) -> str:
     text = message.text or ""
     entities = message.entities or []
-
     if not entities:
         return html.escape(text)
-
-    utf16 = text.encode("utf-16-le")
-    replacements = []
-
-    for entity in entities:
-        try:
-            raw = message.parse_entity(entity)
-        except Exception:
-            continue
-
-        escaped = html.escape(raw)
-        entity_type = str(entity.type)
-
-        if entity_type == "custom_emoji" and entity.custom_emoji_id:
-            rendered = (
-                f'<tg-emoji emoji-id="{entity.custom_emoji_id}">'
-                f"{escaped}</tg-emoji>"
-            )
-        elif entity_type == "bold":
-            rendered = f"<b>{escaped}</b>"
-        elif entity_type == "italic":
-            rendered = f"<i>{escaped}</i>"
-        elif entity_type == "underline":
-            rendered = f"<u>{escaped}</u>"
-        elif entity_type == "strikethrough":
-            rendered = f"<s>{escaped}</s>"
-        elif entity_type == "code":
-            rendered = f"<code>{escaped}</code>"
-        else:
-            continue
-
-        replacements.append(
-            (entity.offset, entity.length, rendered)
-        )
-
-    result = []
-    cursor = 0
-
-    for offset, length, rendered in sorted(replacements):
-        if offset < cursor:
-            continue
-
-        plain = utf16[cursor * 2:offset * 2].decode("utf-16-le")
-        result.append(html.escape(plain))
-        result.append(rendered)
-        cursor = offset + length
-
-    result.append(
-        html.escape(
-            utf16[cursor * 2:].decode("utf-16-le")
-        )
-    )
-    return "".join(result)
-
-
-
-def get_v8_setting(key: str, default: str = "") -> str:
-    with db_connect() as conn:
-        row = conn.execute(
-            "SELECT value FROM settings_v8 WHERE key = ?",
-            (key,),
-        ).fetchone()
-    return row["value"] if row else default
-
-
-def set_v8_setting(key: str, value: str) -> None:
-    with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO settings_v8(key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (key, value),
-        )
+    # PTB의 text_html이 프리미엄 이모지까지 가장 안정적으로 보존됨
+    try:
+        return message.text_html
+    except Exception:
+        return html.escape(text)
 
 
 def extract_custom_emoji_id_from_html(value: str) -> str:
-    match = re.search(
-        r'<tg-emoji\s+emoji-id="([^"]+)"',
-        value or "",
-    )
-    return match.group(1) if match else ""
+    m = re.search(r'<tg-emoji\s+emoji-id="([^"]+)"', value or "")
+    return m.group(1) if m else ""
 
 
 def extract_custom_emoji_id_from_message(message) -> str:
     for entity in message.entities or []:
-        if (
-            str(entity.type) == "custom_emoji"
-            and entity.custom_emoji_id
-        ):
+        if str(entity.type) == "custom_emoji" and entity.custom_emoji_id:
             return entity.custom_emoji_id
     return ""
 
 
 def button_emoji_from_html(value: str) -> str:
-    value = value or ""
-    value = re.sub(
-        r"<tg-emoji[^>]*>.*?</tg-emoji>",
-        "",
-        value,
-        flags=re.DOTALL,
-    )
+    value = re.sub(r"<tg-emoji[^>]*>.*?</tg-emoji>", "", value or "", flags=re.DOTALL)
     value = re.sub(r"<[^>]+>", "", value)
-    value = html.unescape(value).strip()
-    return value[:4]
-
-
-def premium_button(
-    text: str,
-    callback_data: str,
-    custom_emoji_id: str = "",
-    fallback_emoji: str = "",
-) -> InlineKeyboardButton:
-    """
-    Bot API의 icon_custom_emoji_id를 사용합니다.
-    PTB가 필드를 직접 지원하며, api_kwargs는 하위 호환용입니다.
-    """
-    kwargs = {
-        "text": button_label(fallback_emoji, text),
-        "callback_data": callback_data,
-    }
-
-    if custom_emoji_id:
-        kwargs["icon_custom_emoji_id"] = custom_emoji_id
-
-    return InlineKeyboardButton(**kwargs)
+    return html.unescape(value).strip()[:4]
 
 
 def button_label(prefix: str, text: str) -> str:
     prefix = (prefix or "").strip()
     return f"{prefix} {text}".strip()
 
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+def premium_button(text: str, callback_data: str, custom_emoji_id: str = "", fallback_emoji: str = "") -> InlineKeyboardButton:
+    kwargs = {"text": button_label(fallback_emoji, text), "callback_data": callback_data}
+    if custom_emoji_id:
+        kwargs["icon_custom_emoji_id"] = custom_emoji_id
+    try:
+        return InlineKeyboardButton(**kwargs)
+    except TypeError:
+        kwargs.pop("icon_custom_emoji_id", None)
+        return InlineKeyboardButton(**kwargs)
+
+
+def parse_kst(value: str) -> Optional[datetime]:
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y.%m.%d %H:%M", "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=KST)
+        except ValueError:
+            pass
+    return None
+
+
+def fmt_kst(value: str, empty="미설정") -> str:
+    dt = parse_kst(value)
+    return dt.strftime("%Y.%m.%d %H:%M") if dt else empty
 
 
 def get_event(event_id: int) -> Optional[sqlite3.Row]:
     with db_connect() as conn:
-        return conn.execute(
-            """
-            SELECT *
-            FROM events
-            WHERE id = ? AND status != 'deleted'
-            """,
-            (event_id,),
-        ).fetchone()
-
-
-def get_active_event() -> Optional[sqlite3.Row]:
-    events = get_active_events()
-    return events[0] if events else None
-
-
-def get_active_events() -> list[sqlite3.Row]:
-    close_expired_events()
-    with db_connect() as conn:
-        return conn.execute(
-            """
-            SELECT *
-            FROM events
-            WHERE status = 'active'
-            ORDER BY id DESC
-            """
-        ).fetchall()
+        return conn.execute("SELECT * FROM events WHERE id=? AND status!='deleted'", (event_id,)).fetchone()
 
 
 def get_all_events() -> list[sqlite3.Row]:
+    refresh_event_states_sync()
     with db_connect() as conn:
-        return conn.execute(
-            """
-            SELECT *
-            FROM events
-            WHERE status != 'deleted'
-            ORDER BY
-                CASE status
-                    WHEN 'active' THEN 0
-                    WHEN 'draft' THEN 1
-                    WHEN 'ended' THEN 2
-                    ELSE 3
-                END,
-                id DESC
-            """
-        ).fetchall()
+        return conn.execute("""
+            SELECT * FROM events WHERE status!='deleted'
+            ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'scheduled' THEN 1 WHEN 'draft' THEN 2 WHEN 'ended' THEN 3 ELSE 4 END,
+                     COALESCE(NULLIF(start_at,''), created_at) DESC, id DESC
+        """).fetchall()
 
 
-def get_latest_event() -> Optional[sqlite3.Row]:
+def get_active_events() -> list[sqlite3.Row]:
+    refresh_event_states_sync()
     with db_connect() as conn:
-        return conn.execute(
-            """
-            SELECT *
-            FROM events
-            WHERE status != 'deleted'
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
+        return conn.execute("SELECT * FROM events WHERE status='active' ORDER BY id DESC").fetchall()
 
 
 def create_event() -> int:
     now = now_kst()
-
     with db_connect() as conn:
-        cursor = conn.execute(
-            """
+        cur = conn.execute("""
             INSERT INTO events(
-                title, title_html,
-                content, content_html,
-                participation_time, participation_time_html,
-                deadline_at,
-                conditions, conditions_html,
-                approval_text, approval_html,
-                rejection_text, rejection_html,
-                emoji_title, emoji_content, emoji_time,
-                emoji_deadline, emoji_conditions,
-                status, created_at, updated_at
-            )
-            VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                '', '', '', '', '',
-                'draft', ?, ?
-            )
-            """,
-            (
-                "새 이벤트",
-                "새 이벤트",
-                "이벤트 내용을 입력해주세요.",
-                "이벤트 내용을 입력해주세요.",
-                "참가시간을 입력해주세요.",
-                "참가시간을 입력해주세요.",
-                "",
-                "참여조건을 입력해주세요.",
-                "참여조건을 입력해주세요.",
-                "참가승인이 되었습니다.",
-                "참가승인이 되었습니다.",
-                "참가신청이 거절되었습니다.",
-                "참가신청이 거절되었습니다.",
-                now,
-                now,
-            ),
-        )
-        return cursor.lastrowid
+                title,title_html,content,content_html,participation_time,participation_time_html,
+                deadline_at,conditions,conditions_html,approval_text,approval_html,rejection_text,rejection_html,
+                status,created_at,updated_at,start_at,proof_mode,max_photos,announce_start,announce_end
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?,?,?,10,1,1)
+        """, (
+            "새 이벤트", "새 이벤트",
+            "이벤트 내용을 입력해주세요.", "이벤트 내용을 입력해주세요.",
+            "참가시간을 입력해주세요.", "참가시간을 입력해주세요.",
+            "", "참여조건을 입력해주세요.", "참여조건을 입력해주세요.",
+            "✅ 참가승인이 되었습니다.", "✅ 참가승인이 되었습니다.",
+            "❌ 참가신청이 거절되었습니다.", "❌ 참가신청이 거절되었습니다.",
+            now, now, "", "both",
+        ))
+        conn.commit()
+        return cur.lastrowid
 
 
-def update_event_text(
-    event_id: int,
-    field: str,
-    plain_value: str,
-    html_value: str,
-) -> None:
+def update_event_text(event_id: int, field: str, plain_value: str, html_value: str) -> None:
     field_map = {
         "title": ("title", "title_html"),
         "content": ("content", "content_html"),
-        "participation_time": (
-            "participation_time",
-            "participation_time_html",
-        ),
+        "participation_time": ("participation_time", "participation_time_html"),
         "conditions": ("conditions", "conditions_html"),
         "approval": ("approval_text", "approval_html"),
         "rejection": ("rejection_text", "rejection_html"),
     }
-
     if field not in field_map:
         raise ValueError("수정할 수 없는 항목입니다.")
-
-    plain_column, html_column = field_map[field]
-
+    pcol, hcol = field_map[field]
     with db_connect() as conn:
-        conn.execute(
-            f"""
-            UPDATE events
-            SET {plain_column} = ?,
-                {html_column} = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (plain_value, html_value, now_kst(), event_id),
-        )
+        conn.execute(f"UPDATE events SET {pcol}=?,{hcol}=?,updated_at=? WHERE id=?", (plain_value, html_value, now_kst(), event_id))
+        if field == "title":
+            custom_id = extract_custom_emoji_id_from_html(html_value)
+            if custom_id:
+                conn.execute("UPDATE events SET emoji_title_id=? WHERE id=?", (custom_id, event_id))
+        conn.commit()
 
 
-def update_event_emoji(
-    event_id: int,
-    field: str,
-    html_value: str,
-    custom_emoji_id: str = "",
-) -> None:
-    column_map = {
-        "emoji_title": "emoji_title",
-        "emoji_content": "emoji_content",
-        "emoji_time": "emoji_time",
-        "emoji_deadline": "emoji_deadline",
-        "emoji_conditions": "emoji_conditions",
-    }
-
-    column = column_map.get(field)
-    if not column:
+def update_event_emoji(event_id: int, field: str, html_value: str, custom_emoji_id: str = "") -> None:
+    allowed = {"emoji_title", "emoji_content", "emoji_time", "emoji_deadline", "emoji_conditions"}
+    if field not in allowed:
         raise ValueError("수정할 수 없는 이모지 항목입니다.")
-
     with db_connect() as conn:
         if field == "emoji_title":
-            conn.execute(
-                """
-                UPDATE events
-                SET emoji_title = ?,
-                    emoji_title_id = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    html_value,
-                    custom_emoji_id,
-                    now_kst(),
-                    event_id,
-                ),
-            )
+            conn.execute("UPDATE events SET emoji_title=?,emoji_title_id=?,updated_at=? WHERE id=?", (html_value, custom_emoji_id, now_kst(), event_id))
         else:
-            conn.execute(
-                f"UPDATE events SET {column} = ?, updated_at = ? WHERE id = ?",
-                (html_value, now_kst(), event_id),
-            )
+            conn.execute(f"UPDATE events SET {field}=?,updated_at=? WHERE id=?", (html_value, now_kst(), event_id))
+        conn.commit()
 
 
-def update_event_deadline(event_id: int, value: str) -> None:
+def set_event_field(event_id: int, field: str, value) -> None:
+    allowed = {
+        "start_at", "deadline_at", "proof_mode", "max_photos", "media_file_id", "media_type",
+        "announce_start", "announce_end", "start_announced", "end_announced", "status"
+    }
+    if field not in allowed:
+        raise ValueError("잘못된 이벤트 설정입니다.")
     with db_connect() as conn:
-        conn.execute(
-            """
-            UPDATE events
-            SET deadline_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (value, now_kst(), event_id),
-        )
+        conn.execute(f"UPDATE events SET {field}=?,updated_at=? WHERE id=?", (value, now_kst(), event_id))
+        conn.commit()
 
 
-def parse_deadline(value: str) -> Optional[datetime]:
-    value = (value or "").strip()
-    if not value:
-        return None
-
-    try:
-        return datetime.strptime(
-            value,
-            "%Y-%m-%d %H:%M",
-        ).replace(tzinfo=KST)
-    except ValueError:
-        return None
-
-
-def event_is_open(event: sqlite3.Row) -> bool:
-    if event["status"] != "active":
-        return False
-
-    deadline = parse_deadline(event["deadline_at"])
-    return deadline is None or datetime.now(KST) <= deadline
-
-
-def close_expired_events() -> None:
-    now = datetime.now(KST)
-
+def start_event(event_id: int, manual: bool = True) -> None:
     with db_connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, deadline_at
-            FROM events
-            WHERE status = 'active'
-              AND deadline_at IS NOT NULL
-              AND deadline_at != ''
-            """
-        ).fetchall()
-
-        for row in rows:
-            deadline = parse_deadline(row["deadline_at"])
-            if deadline and now > deadline:
-                conn.execute(
-                    """
-                    UPDATE events
-                    SET status = 'ended',
-                        ended_at = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (now_kst(), now_kst(), row["id"]),
-                )
-
-
-def start_event(event_id: int) -> None:
-    with db_connect() as conn:
-        conn.execute(
-            """
-            UPDATE events
-            SET status = 'active',
-                started_at = COALESCE(started_at, ?),
-                ended_at = NULL,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (now_kst(), now_kst(), event_id),
-        )
+        conn.execute("UPDATE events SET status='active',started_at=COALESCE(started_at,?),ended_at=NULL,updated_at=? WHERE id=?", (now_kst(), now_kst(), event_id))
+        if manual:
+            conn.execute("UPDATE events SET start_announced=0 WHERE id=?", (event_id,))
+        conn.commit()
 
 
 def end_event(event_id: int) -> None:
     with db_connect() as conn:
-        conn.execute(
-            """
-            UPDATE events
-            SET status = 'ended',
-                ended_at = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (now_kst(), now_kst(), event_id),
-        )
+        conn.execute("UPDATE events SET status='ended',ended_at=?,updated_at=? WHERE id=?", (now_kst(), now_kst(), event_id))
+        conn.commit()
 
 
 def delete_event(event_id: int) -> None:
     with db_connect() as conn:
-        conn.execute(
-            """
-            UPDATE events
-            SET status = 'deleted',
-                deleted_at = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (now_kst(), now_kst(), event_id),
-        )
+        conn.execute("UPDATE events SET status='deleted',deleted_at=?,updated_at=? WHERE id=?", (now_kst(), now_kst(), event_id))
+        conn.commit()
 
 
-def event_title_html(event: sqlite3.Row) -> str:
-    return event["title_html"] or html.escape(event["title"])
+def refresh_event_states_sync() -> None:
+    """DB 상태만 갱신. 공지는 scheduler가 따로 발송합니다."""
+    now = now_dt()
+    with db_connect() as conn:
+        rows = conn.execute("SELECT id,status,start_at,deadline_at FROM events WHERE status!='deleted'").fetchall()
+        for row in rows:
+            start = parse_kst(row["start_at"])
+            end = parse_kst(row["deadline_at"])
+            status = row["status"]
+            if end and now > end and status not in {"ended", "deleted"}:
+                conn.execute("UPDATE events SET status='ended',ended_at=COALESCE(ended_at,?),updated_at=? WHERE id=?", (now_kst(), now_kst(), row["id"]))
+            elif start and now >= start and (not end or now <= end) and status in {"draft", "scheduled", "ended"}:
+                conn.execute("UPDATE events SET status='active',started_at=COALESCE(started_at,?),ended_at=NULL,updated_at=? WHERE id=?", (now_kst(), now_kst(), row["id"]))
+            elif start and now < start and status == "draft":
+                conn.execute("UPDATE events SET status='scheduled',updated_at=? WHERE id=?", (now_kst(), row["id"]))
+        conn.commit()
 
 
-def event_time_html(event: sqlite3.Row) -> str:
-    return (
-        event["participation_time_html"]
-        or html.escape(event["participation_time"])
-    )
+def event_is_open(event: sqlite3.Row) -> bool:
+    refresh_event_states_sync()
+    fresh = get_event(event["id"])
+    return bool(fresh and fresh["status"] == "active")
 
 
-def event_conditions_html(event: sqlite3.Row) -> str:
-    return (
-        event["conditions_html"]
-        or html.escape(event["conditions"])
-    )
+def event_title_html(event) -> str:
+    return event["title_html"] or html.escape(event["title"] or "")
 
 
-def field_prefix(event: sqlite3.Row, column: str) -> str:
-    value = event[column] or ""
-    return f"{value} " if value else ""
-
-
-def event_content_html(event: sqlite3.Row) -> str:
+def event_content_html(event) -> str:
     return event["content_html"] or html.escape(event["content"] or "")
 
 
+def event_time_html(event) -> str:
+    return event["participation_time_html"] or html.escape(event["participation_time"] or "")
+
+
+def event_conditions_html(event) -> str:
+    return event["conditions_html"] or html.escape(event["conditions"] or "")
+
+
+def field_prefix(event, col: str) -> str:
+    return f"{event[col]} " if event[col] else ""
+
+
+def proof_mode_text(mode: str) -> str:
+    return {
+        "both": "당일 채팅기록 / 당일 제휴 이용내역",
+        "chat": "당일 채팅기록",
+        "partner": "당일 제휴 이용내역",
+    }.get(mode, "당일 채팅기록 / 당일 제휴 이용내역")
+
+
 def event_card(event: sqlite3.Row, admin: bool = False) -> str:
-    status = {
-        "draft": "등록 대기",
-        "active": "신청 가능",
-        "ended": "종료",
-    }.get(event["status"], event["status"])
-
-    deadline_text = event["deadline_at"] or "별도 마감시간 없음"
-
+    status = {"draft": "등록 대기", "scheduled": "예약", "active": "신청 가능", "ended": "종료"}.get(event["status"], event["status"])
+    start_text = fmt_kst(event["start_at"], "수동 시작")
+    deadline_text = fmt_kst(event["deadline_at"], "별도 마감시간 없음")
     text = (
-        f"<b>{field_prefix(event, 'emoji_title')}"
-        f"{event_title_html(event)}</b>\n\n"
+        f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n\n"
         f"{CARD_LINE}\n\n"
-        f"<b>{field_prefix(event, 'emoji_content')}이벤트 내용</b>\n"
-        f"{event_content_html(event)}\n\n"
-        f"<b>{field_prefix(event, 'emoji_time')}참가시간</b>\n"
-        f"{event_time_html(event)}\n\n"
-        f"<b>{field_prefix(event, 'emoji_deadline')}참여 마감시간</b>\n"
-        f"{html.escape(deadline_text)}\n\n"
-        f"<b>{field_prefix(event, 'emoji_conditions')}참여조건</b>\n"
-        f"{event_conditions_html(event)}\n\n"
+        f"<b>{field_prefix(event,'emoji_content')}이벤트 내용</b>\n{event_content_html(event)}\n\n"
+        f"<b>{field_prefix(event,'emoji_time')}참가시간</b>\n{event_time_html(event)}\n\n"
+        f"<b>⏰ 자동 시작</b>\n{html.escape(start_text)}\n\n"
+        f"<b>{field_prefix(event,'emoji_deadline')}참여 마감시간</b>\n{html.escape(deadline_text)}\n\n"
+        f"<b>{field_prefix(event,'emoji_conditions')}참여조건</b>\n{event_conditions_html(event)}\n\n"
+        f"<b>📸 인증방식</b>\n{html.escape(proof_mode_text(event['proof_mode']))}\n\n"
         f"{CARD_LINE}"
     )
-
     if admin:
         text += (
-            f"\n\n<b>상태</b> : {status}\n"
-            f"<b>이벤트 번호</b> : <code>#{event['id']}</code>"
+            f"\n\n<b>상태</b> : {status}"
+            f"\n<b>이벤트 번호</b> : <code>#{event['id']}</code>"
+            f"\n<b>인증사진</b> : 최대 {event['max_photos']}장"
+            f"\n<b>시작공지</b> : {'ON' if event['announce_start'] else 'OFF'}"
+            f"\n<b>마감공지</b> : {'ON' if event['announce_end'] else 'OFF'}"
+            f"\n<b>대표미디어</b> : {event['media_type'] or '없음'}"
         )
-
     return text
 
 
 def no_event_card() -> str:
-    return (
-        "📭 <b>현재 참여할 수 있는 이벤트가 없습니다.</b>\n\n"
-        "새 이벤트가 등록되면 다시 이용해주세요."
-    )
-
-
-def member_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
-    status_custom_id = get_v8_setting(
-        "status_button_emoji_id",
-        "",
-    )
-    status_fallback = get_v8_setting(
-        "status_button_emoji",
-        "",
-    )
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "이 이벤트 참여",
-                callback_data=f"user:apply:{event_id}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅ 진행 이벤트 목록",
-                callback_data="user:event_list",
-            )
-        ],
-        [
-            premium_button(
-                "내 신청 상태",
-                callback_data="user:status",
-                custom_emoji_id=status_custom_id,
-                fallback_emoji=status_fallback,
-            )
-        ],
-    ])
-
-
-def member_event_list_keyboard(
-    events: list[sqlite3.Row],
-) -> InlineKeyboardMarkup:
-    rows = []
-
-    for event in events:
-        title = event["title"] or f"이벤트 #{event['id']}"
-        custom_id = (
-            event["emoji_title_id"]
-            or extract_custom_emoji_id_from_html(
-                event["emoji_title"] or ""
-            )
-        )
-        fallback = button_emoji_from_html(
-            event["emoji_title"] or ""
-        )
-
-        rows.append([
-            premium_button(
-                title[:30],
-                callback_data=f"user:event:{event['id']}",
-                custom_emoji_id=custom_id,
-                fallback_emoji=fallback,
-            )
-        ])
-
-    status_custom_id = get_v8_setting(
-        "status_button_emoji_id",
-        "",
-    )
-    status_fallback = get_v8_setting(
-        "status_button_emoji",
-        "",
-    )
-
-    rows.append([
-        premium_button(
-            "내 신청 상태",
-            callback_data="user:status",
-            custom_emoji_id=status_custom_id,
-            fallback_emoji=status_fallback,
-        )
-    ])
-
-    return InlineKeyboardMarkup(rows)
+    return "📭 <b>현재 참여할 수 있는 이벤트가 없습니다.</b>\n\n새 이벤트가 등록되면 다시 이용해주세요."
 
 
 def member_no_event_keyboard() -> InlineKeyboardMarkup:
-    status_custom_id = get_v8_setting(
-        "status_button_emoji_id",
-        "",
-    )
-    status_fallback = get_v8_setting(
-        "status_button_emoji",
-        "",
-    )
+    return InlineKeyboardMarkup([[premium_button(
+        "내 신청 상태", "user:status",
+        get_setting("status_button_emoji_id", ""),
+        get_setting("status_button_emoji", "")
+    )]])
 
+
+def member_event_list_keyboard(events: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    rows = []
+    for event in events:
+        custom_id = event["emoji_title_id"] or extract_custom_emoji_id_from_html(event["emoji_title"] or "")
+        fallback = button_emoji_from_html(event["emoji_title"] or "")
+        rows.append([premium_button((event["title"] or f"이벤트 #{event['id']}")[:35], f"user:event:{event['id']}", custom_id, fallback)])
+    rows.append([premium_button("내 신청 상태", "user:status", get_setting("status_button_emoji_id", ""), get_setting("status_button_emoji", ""))])
+    return InlineKeyboardMarkup(rows)
+
+
+def member_event_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            premium_button(
-                "내 신청 상태",
-                callback_data="user:status",
-                custom_emoji_id=status_custom_id,
-                fallback_emoji=status_fallback,
-            )
-        ]
+        [InlineKeyboardButton("🎁 이 이벤트 참여", callback_data=f"user:apply:{event['id']}")],
+        [InlineKeyboardButton("⬅ 진행 이벤트 목록", callback_data="user:event_list")],
+        [premium_button("내 신청 상태", "user:status", get_setting("status_button_emoji_id", ""), get_setting("status_button_emoji", ""))],
     ])
 
 
-def active_events_card(events: list[sqlite3.Row]) -> str:
-    if not events:
-        return no_event_card()
+def proof_keyboard(event_id: int, mode: str) -> InlineKeyboardMarkup:
+    rows = []
+    if mode in {"both", "chat"}:
+        rows.append([InlineKeyboardButton("💬 당일 채팅 인증", callback_data=f"proof:chat:{event_id}")])
+    if mode in {"both", "partner"}:
+        rows.append([InlineKeyboardButton("🤝 당일 제휴 이용 인증", callback_data=f"proof:partner:{event_id}")])
+    rows.append([InlineKeyboardButton("⬅ 이벤트로 돌아가기", callback_data=f"user:event:{event_id}")])
+    return InlineKeyboardMarkup(rows)
 
-    return "<b>진행 중인 이벤트를 선택해주세요.</b>"
+
+def submission_keyboard(application_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 인증 제출", callback_data=f"submit:finish:{application_id}")],
+        [InlineKeyboardButton("🗑 신청 취소", callback_data=f"submit:cancel:{application_id}")],
+    ])
+
+
+def admin_application_keyboard(application_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ 참가 승인", callback_data=f"application:approve:{application_id}"),
+        InlineKeyboardButton("❌ 참가 거절", callback_data=f"application:reject:{application_id}"),
+    ]])
+
+
+def reject_reason_keyboard(application_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📸 인증사진 확인 불가", callback_data=f"reject:photo:{application_id}")],
+        [InlineKeyboardButton("📅 당일 기록 확인 불가", callback_data=f"reject:date:{application_id}")],
+        [InlineKeyboardButton("❗ 참여조건 미달", callback_data=f"reject:condition:{application_id}")],
+        [InlineKeyboardButton("🔁 중복 신청", callback_data=f"reject:duplicate:{application_id}")],
+        [InlineKeyboardButton("✏ 직접 사유 입력", callback_data=f"reject:custom:{application_id}")],
+    ])
 
 
 def admin_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ 이벤트 새로 등록", callback_data="admin:new_event")],
         [InlineKeyboardButton("📚 전체 이벤트 관리", callback_data="admin:event_list")],
-        [
-            InlineKeyboardButton("📋 전체 승인 대기", callback_data="admin:pending"),
-            InlineKeyboardButton("📊 전체 신청 현황", callback_data="admin:stats"),
-        ],
-        [
-            InlineKeyboardButton(
-                "내 신청상태 버튼 이모지",
-                callback_data="admin:status_emoji",
-            )
-        ],
+        [InlineKeyboardButton("📋 전체 승인 대기", callback_data="admin:pending"), InlineKeyboardButton("📊 전체 신청 현황", callback_data="admin:stats")],
+        [InlineKeyboardButton("🔗 그룹/공지 설정", callback_data="admin:group")],
+        [InlineKeyboardButton("🎨 내 신청상태 버튼 이모지", callback_data="admin:status_emoji")],
         [InlineKeyboardButton("❌ 관리자 메뉴 닫기", callback_data="admin:close")],
     ])
 
 
 def admin_event_list_keyboard() -> InlineKeyboardMarkup:
     rows = []
-    for event in get_all_events():
-        status_icon = {"active": "🟢", "draft": "⚪", "ended": "🔴"}.get(
-            event["status"], "▫️"
-        )
-        rows.append([
-            InlineKeyboardButton(
-                f"{status_icon} #{event['id']} {event['title'][:24]}",
-                callback_data=f"event:manage:{event['id']}",
-            )
-        ])
-
-    rows.append([InlineKeyboardButton("➕ 이벤트 새로 등록", callback_data="admin:new_event")])
-    rows.append([InlineKeyboardButton("⬅ 관리자 메뉴", callback_data="admin:home")])
+    for event in get_all_events()[:50]:
+        icon = {"active": "🟢", "scheduled": "⏰", "draft": "⚪", "ended": "🔴"}.get(event["status"], "▫️")
+        rows.append([InlineKeyboardButton(f"{icon} #{event['id']} {(event['title'] or '')[:25]}", callback_data=f"event:manage:{event['id']}")])
+    rows += [[InlineKeyboardButton("➕ 이벤트 새로 등록", callback_data="admin:new_event")], [InlineKeyboardButton("⬅ 관리자 메뉴", callback_data="admin:home")]]
     return InlineKeyboardMarkup(rows)
 
 
 def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
     rows = [
-        [
-            InlineKeyboardButton(
-                "이벤트명 수정",
-                callback_data=f"edit:title:{event['id']}",
-            ),
-            InlineKeyboardButton(
-                "내용 수정",
-                callback_data=f"edit:content:{event['id']}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "참가시간 수정",
-                callback_data=f"edit:participation_time:{event['id']}",
-            ),
-            InlineKeyboardButton(
-                "마감시간 설정",
-                callback_data=f"deadline:set:{event['id']}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "참여조건 수정",
-                callback_data=f"edit:conditions:{event['id']}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "승인문구 수정",
-                callback_data=f"edit:approval:{event['id']}",
-            ),
-            InlineKeyboardButton(
-                "거절문구 수정",
-                callback_data=f"edit:rejection:{event['id']}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "이모지 설정",
-                callback_data=f"emoji:menu:{event['id']}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "미리보기",
-                callback_data=f"event:preview:{event['id']}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "이 이벤트 승인 대기",
-                callback_data=f"event:pending:{event['id']}",
-            ),
-            InlineKeyboardButton(
-                "이 이벤트 현황",
-                callback_data=f"event:stats:{event['id']}",
-            ),
-        ],
+        [InlineKeyboardButton("이벤트명 수정", callback_data=f"edit:title:{event['id']}"), InlineKeyboardButton("내용 수정", callback_data=f"edit:content:{event['id']}")],
+        [InlineKeyboardButton("참가시간 문구", callback_data=f"edit:participation_time:{event['id']}"), InlineKeyboardButton("참여조건 수정", callback_data=f"edit:conditions:{event['id']}")],
+        [InlineKeyboardButton("⏰ 시작시간 설정", callback_data=f"schedule:start:{event['id']}"), InlineKeyboardButton("🔒 마감시간 설정", callback_data=f"schedule:end:{event['id']}")],
+        [InlineKeyboardButton("📸 인증방식", callback_data=f"proofmode:menu:{event['id']}"), InlineKeyboardButton("🖼 대표 이미지/GIF", callback_data=f"media:set:{event['id']}")],
+        [InlineKeyboardButton("✅ 승인문구", callback_data=f"edit:approval:{event['id']}"), InlineKeyboardButton("❌ 거절문구", callback_data=f"edit:rejection:{event['id']}")],
+        [InlineKeyboardButton("✨ 이모지 설정", callback_data=f"emoji:menu:{event['id']}")],
+        [InlineKeyboardButton(f"📢 시작공지 {'ON' if event['announce_start'] else 'OFF'}", callback_data=f"toggle:start_notice:{event['id']}"), InlineKeyboardButton(f"🔒 마감공지 {'ON' if event['announce_end'] else 'OFF'}", callback_data=f"toggle:end_notice:{event['id']}")],
+        [InlineKeyboardButton("📣 지금 그룹에 시작안내", callback_data=f"announce:start:{event['id']}"), InlineKeyboardButton("📣 지금 그룹에 마감안내", callback_data=f"announce:end:{event['id']}")],
+        [InlineKeyboardButton("👁 미리보기", callback_data=f"event:preview:{event['id']}")],
+        [InlineKeyboardButton("📋 이 이벤트 승인 대기", callback_data=f"event:pending:{event['id']}"), InlineKeyboardButton("📊 이 이벤트 현황", callback_data=f"event:stats:{event['id']}")],
     ]
-
     if event["status"] == "active":
-        rows.append([
-            InlineKeyboardButton(
-                "이벤트 종료",
-                callback_data=f"event:end:{event['id']}",
-            )
-        ])
+        rows.append([InlineKeyboardButton("🛑 지금 이벤트 종료", callback_data=f"event:end:{event['id']}")])
     else:
-        rows.append([
-            InlineKeyboardButton(
-                "이벤트 시작",
-                callback_data=f"event:start:{event['id']}",
-            )
-        ])
-
+        rows.append([InlineKeyboardButton("▶ 지금 이벤트 시작", callback_data=f"event:start:{event['id']}")])
     if event["status"] != "active":
-        rows.append([
-            InlineKeyboardButton(
-                "이벤트 삭제",
-                callback_data=f"event:delete_confirm:{event['id']}",
-            )
-        ])
-
-    rows.append([
-        InlineKeyboardButton(
-            "⬅ 전체 이벤트",
-            callback_data="admin:event_list",
-        )
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            "⬅ 관리자 메뉴",
-            callback_data="admin:home",
-        )
-    ])
-
+        rows.append([InlineKeyboardButton("🗑 이벤트 삭제", callback_data=f"event:delete_confirm:{event['id']}")])
+    rows += [[InlineKeyboardButton("⬅ 전체 이벤트", callback_data="admin:event_list")], [InlineKeyboardButton("⬅ 관리자 메뉴", callback_data="admin:home")]]
     return InlineKeyboardMarkup(rows)
 
 
 def emoji_manage_keyboard(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "제목 이모지",
-                callback_data=f"emoji_edit:emoji_title:{event_id}",
-            ),
-            InlineKeyboardButton(
-                "내용 이모지",
-                callback_data=f"emoji_edit:emoji_content:{event_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "참가시간 이모지",
-                callback_data=f"emoji_edit:emoji_time:{event_id}",
-            ),
-            InlineKeyboardButton(
-                "마감시간 이모지",
-                callback_data=f"emoji_edit:emoji_deadline:{event_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "참여조건 이모지",
-                callback_data=f"emoji_edit:emoji_conditions:{event_id}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "모든 이모지 제거",
-                callback_data=f"emoji:clear:{event_id}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅ 이벤트 관리",
-                callback_data=f"event:manage:{event_id}",
-            )
-        ],
+        [InlineKeyboardButton("제목 이모지", callback_data=f"emoji_edit:emoji_title:{event_id}"), InlineKeyboardButton("내용 이모지", callback_data=f"emoji_edit:emoji_content:{event_id}")],
+        [InlineKeyboardButton("참가시간 이모지", callback_data=f"emoji_edit:emoji_time:{event_id}"), InlineKeyboardButton("마감시간 이모지", callback_data=f"emoji_edit:emoji_deadline:{event_id}")],
+        [InlineKeyboardButton("참여조건 이모지", callback_data=f"emoji_edit:emoji_conditions:{event_id}")],
+        [InlineKeyboardButton("모든 이모지 제거", callback_data=f"emoji:clear:{event_id}")],
+        [InlineKeyboardButton("⬅ 이벤트 관리", callback_data=f"event:manage:{event_id}")],
     ])
 
 
-def edit_back_keyboard(event_id: int) -> InlineKeyboardMarkup:
+def group_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "⬅ 이벤트 관리",
-                callback_data=f"event:manage:{event_id}",
-            )
-        ]
+        [InlineKeyboardButton("📢 시작 전체공지 ON/OFF", callback_data="group:toggle_start")],
+        [InlineKeyboardButton("🔒 마감 전체공지 ON/OFF", callback_data="group:toggle_end")],
+        [InlineKeyboardButton("✏ 시작 공지문구 수정", callback_data="group:text_start")],
+        [InlineKeyboardButton("✏ 마감 공지문구 수정", callback_data="group:text_end")],
+        [InlineKeyboardButton("⬅ 관리자 메뉴", callback_data="admin:home")],
     ])
 
 
-def delete_confirm_keyboard(event_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🗑 정말 삭제",
-                callback_data=f"event:delete:{event_id}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅ 이벤트 관리",
-                callback_data=f"event:manage:{event_id}",
-            )
-        ],
-    ])
+def simple_back(event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ 이벤트 관리", callback_data=f"event:manage:{event_id}")]])
 
 
-def submission_keyboard(application_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ 사진 제출 완료",
-                callback_data=f"submit:finish:{application_id}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🗑 신청 취소",
-                callback_data=f"submit:cancel:{application_id}",
-            )
-        ],
-    ])
-
-
-def admin_application_keyboard(application_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ 참가 승인",
-                callback_data=f"application:approve:{application_id}",
-            ),
-            InlineKeyboardButton(
-                "❌ 참가 거절",
-                callback_data=f"application:reject:{application_id}",
-            ),
-        ]
-    ])
-
-
-def get_application(application_id: int) -> Optional[sqlite3.Row]:
+def get_user_event_application(event_id: int, user_id: int) -> Optional[sqlite3.Row]:
     with db_connect() as conn:
-        return conn.execute(
-            """
-            SELECT *
-            FROM applications_v6
-            WHERE id = ?
-            """,
-            (application_id,),
-        ).fetchone()
+        return conn.execute("SELECT * FROM applications_v6 WHERE event_id=? AND user_id=? ORDER BY id DESC LIMIT 1", (event_id, user_id)).fetchone()
 
 
 def get_latest_user_application(user_id: int) -> Optional[sqlite3.Row]:
     with db_connect() as conn:
-        return conn.execute(
-            """
-            SELECT *
-            FROM applications_v6
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (user_id,),
-        ).fetchone()
+        return conn.execute("SELECT * FROM applications_v6 WHERE user_id=? ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
 
 
-def get_user_event_application(
-    event_id: int,
-    user_id: int,
-) -> Optional[sqlite3.Row]:
+def get_application(application_id: int) -> Optional[sqlite3.Row]:
     with db_connect() as conn:
-        return conn.execute(
-            """
-            SELECT *
-            FROM applications_v6
-            WHERE event_id = ? AND user_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (event_id, user_id),
-        ).fetchone()
+        return conn.execute("SELECT * FROM applications_v6 WHERE id=?", (application_id,)).fetchone()
 
 
-def create_application(event: sqlite3.Row, user) -> int:
+def create_application(event: sqlite3.Row, user, proof_type: str) -> int:
     with db_connect() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO applications_v6(
-                event_id, event_title,
-                user_id, name, username,
-                status, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, 'collecting', ?)
-            """,
-            (
-                event["id"],
-                event["title"],
-                user.id,
-                user.full_name,
-                f"@{user.username}" if user.username else "없음",
-                now_kst(),
-            ),
-        )
-        return cursor.lastrowid
+        cur = conn.execute("""
+            INSERT INTO applications_v6(event_id,event_title,user_id,name,username,status,created_at,proof_type)
+            VALUES(?,?,?,?,?,'collecting',?,?)
+        """, (event["id"], event["title"], user.id, user.full_name, f"@{user.username}" if user.username else "없음", now_kst(), proof_type))
+        conn.commit()
+        return cur.lastrowid
 
 
 def application_photo_count(application_id: int) -> int:
     with db_connect() as conn:
-        return conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM application_photos_v6
-            WHERE application_id = ?
-            """,
-            (application_id,),
-        ).fetchone()["count"]
+        return conn.execute("SELECT COUNT(*) c FROM application_photos_v6 WHERE application_id=?", (application_id,)).fetchone()["c"]
 
 
-def add_application_photo(
-    application_id: int,
-    file_id: str,
-) -> bool:
-    if application_photo_count(application_id) >= 5:
+def add_application_photo(application_id: int, file_id: str, max_photos: int) -> bool:
+    if application_photo_count(application_id) >= max_photos:
         return False
-
     with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO application_photos_v6(
-                application_id, file_id, created_at
-            )
-            VALUES (?, ?, ?)
-            """,
-            (application_id, file_id, now_kst()),
-        )
-
+        conn.execute("INSERT INTO application_photos_v6(application_id,file_id,created_at) VALUES(?,?,?)", (application_id, file_id, now_kst()))
+        conn.commit()
     return True
 
 
 def get_application_photos(application_id: int) -> list[str]:
     with db_connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT file_id
-            FROM application_photos_v6
-            WHERE application_id = ?
-            ORDER BY id
-            """,
-            (application_id,),
-        ).fetchall()
-
-    return [row["file_id"] for row in rows]
+        rows = conn.execute("SELECT file_id FROM application_photos_v6 WHERE application_id=? ORDER BY id", (application_id,)).fetchall()
+    return [r["file_id"] for r in rows]
 
 
-def set_application_status(
-    application_id: int,
-    status: str,
-    processed_by: Optional[int] = None,
-) -> None:
+def set_application_status(application_id: int, status: str, processed_by: Optional[int] = None, reason: str = "") -> None:
     with db_connect() as conn:
         if status == "pending":
-            conn.execute(
-                """
-                UPDATE applications_v6
-                SET status = 'pending',
-                    submitted_at = ?
-                WHERE id = ?
-                """,
-                (now_kst(), application_id),
-            )
+            conn.execute("UPDATE applications_v6 SET status='pending',submitted_at=?,admin_notified=1 WHERE id=?", (now_kst(), application_id))
         else:
-            conn.execute(
-                """
-                UPDATE applications_v6
-                SET status = ?,
-                    processed_at = ?,
-                    processed_by = ?
-                WHERE id = ?
-                """,
-                (
-                    status,
-                    now_kst(),
-                    processed_by,
-                    application_id,
-                ),
-            )
+            conn.execute("UPDATE applications_v6 SET status=?,processed_at=?,processed_by=?,reject_reason=? WHERE id=?", (status, now_kst(), processed_by, reason, application_id))
+        conn.commit()
 
 
 def delete_application(application_id: int) -> None:
     with db_connect() as conn:
-        conn.execute(
-            """
-            DELETE FROM application_photos_v6
-            WHERE application_id = ?
-            """,
-            (application_id,),
-        )
-        conn.execute(
-            """
-            DELETE FROM applications_v6
-            WHERE id = ? AND status = 'collecting'
-            """,
-            (application_id,),
-        )
+        conn.execute("DELETE FROM application_photos_v6 WHERE application_id=?", (application_id,))
+        conn.execute("DELETE FROM applications_v6 WHERE id=? AND status='collecting'", (application_id,))
+        conn.commit()
 
 
 def status_card(row: Optional[sqlite3.Row]) -> str:
     if not row:
-        return (
-            "📋 <b>내 신청 상태</b>\n\n"
-            f"{CARD_LINE}\n\n"
-            "📭 신청 내역이 없습니다.\n\n"
-            f"{CARD_LINE}"
-        )
-
+        return f"📋 <b>내 신청 상태</b>\n\n{CARD_LINE}\n\n📭 신청 내역이 없습니다.\n\n{CARD_LINE}"
+    reason = f"\n\n<b>거절사유</b>\n{html.escape(row['reject_reason'])}" if row["reject_reason"] else ""
+    proof = f"\n\n<b>인증방식</b>\n{html.escape(PROOF_TEXT.get(row['proof_type'], row['proof_type'] or '-'))}" if "proof_type" in row.keys() else ""
     return (
-        "📋 <b>내 신청 상태</b>\n\n"
-        f"{CARD_LINE}\n\n"
-        f"<b>🎉 이벤트</b>\n"
-        f"{html.escape(row['event_title'])}\n\n"
-        f"<b>📌 신청번호</b>\n"
-        f"<code>#{row['id']}</code>\n\n"
-        f"<b>📊 상태</b>\n"
-        f"{STATUS_TEXT.get(row['status'], html.escape(row['status']))}\n\n"
-        f"<b>🕒 신청시간</b>\n"
-        f"{html.escape(row['created_at'])}\n\n"
-        f"{CARD_LINE}"
+        f"📋 <b>내 신청 상태</b>\n\n{CARD_LINE}\n\n"
+        f"<b>🎉 이벤트</b>\n{html.escape(row['event_title'])}\n\n"
+        f"<b>📌 신청번호</b>\n<code>#{row['id']}</code>\n\n"
+        f"<b>📊 상태</b>\n{STATUS_TEXT.get(row['status'], html.escape(row['status']))}"
+        f"{proof}{reason}\n\n<b>🕒 신청시간</b>\n{html.escape(row['created_at'])}\n\n{CARD_LINE}"
     )
 
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    events = get_active_events()
-
-    if not events:
-        await update.effective_message.reply_text(
-            no_event_card(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=member_no_event_keyboard(),
-        )
-        return
-
-    await update.effective_message.reply_text(
-        active_events_card(events),
-        parse_mode=ParseMode.HTML,
-        reply_markup=member_event_list_keyboard(events),
-    )
+async def send_event_card(bot, chat_id: int, event: sqlite3.Row, reply_markup=None, admin=False):
+    text = event_card(event, admin=admin)
+    file_id = event["media_file_id"] or ""
+    mtype = event["media_type"] or ""
+    try:
+        if file_id and mtype == "animation":
+            await bot.send_animation(chat_id, animation=file_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        elif file_id and mtype == "photo":
+            await bot.send_photo(chat_id, photo=file_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        else:
+            await bot.send_message(chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except BadRequest as e:
+        logger.warning("미디어 카드 실패, 텍스트로 대체: %s", e)
+        await bot.send_message(chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 
-async def admin_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "관리자만 사용할 수 있습니다."
-        )
-        return
-
-    context.user_data.clear()
-
-    await update.effective_message.reply_text(
-        "⚙️ <b>이벤트 관리자 메뉴</b>\n\n"
-        "이벤트를 등록하거나 관리해주세요.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_home_keyboard(),
-    )
+async def bot_deep_link(application: Application, event_id: int) -> str:
+    username = application.bot.username
+    if not username:
+        me = await application.bot.get_me()
+        username = me.username
+    return f"https://t.me/{username}?start=event_{event_id}"
 
 
-async def ping_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    await update.effective_message.reply_text(
-        "✅ 신사 이벤트 참여봇 V8.2 정상 작동 중"
-    )
+async def send_group_notice(application: Application, event_id: int, kind: str, manual=False) -> tuple[bool, str]:
+    group_id = get_setting("group_id", "").strip()
+    if not group_id:
+        return False, "❌ 등록된 그룹이 없습니다. 그룹방에서 /setgroup 을 먼저 실행해주세요."
+    event = get_event(event_id)
+    if not event:
+        return False, "❌ 이벤트를 찾을 수 없습니다."
 
-
-async def status_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    await update.effective_message.reply_text(
-        status_card(
-            get_latest_user_application(
-                update.effective_user.id
+    if kind == "start":
+        if not manual and (not event["announce_start"] or get_setting("group_start_notice_enabled", "1") != "1"):
+            return True, "시작 공지 OFF"
+        custom = get_setting("group_start_text", "").strip()
+        if custom:
+            text = custom.replace("{event}", event["title"]).replace("{start}", fmt_kst(event["start_at"])).replace("{end}", fmt_kst(event["deadline_at"]))
+            text = html.escape(text)
+        else:
+            text = (
+                "🎉 <b>EVENT OPEN</b>\n\n"
+                f"<b>{event_title_html(event)}</b>\n\n"
+                f"{event_content_html(event)}\n\n"
+                f"<b>🕒 참여기간</b>\n{html.escape(fmt_kst(event['start_at'], '지금부터'))} ~ {html.escape(fmt_kst(event['deadline_at'], '별도 마감 없음'))}\n\n"
+                f"<b>📌 참여조건</b>\n{event_conditions_html(event)}\n\n"
+                f"<b>📸 인증방식</b>\n{html.escape(proof_mode_text(event['proof_mode']))}\n\n"
+                "아래 버튼을 눌러 이벤트에 참여해주세요."
             )
-        ),
+        link = await bot_deep_link(application, event_id)
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 이벤트 참여하기", url=link)]])
+        try:
+            await send_event_notice_media(application.bot, int(group_id), event, text, markup)
+        except Exception as exc:
+            logger.exception("그룹 시작공지 실패")
+            return False, f"❌ 그룹 시작공지 실패: {type(exc).__name__}"
+        if not manual:
+            set_event_field(event_id, "start_announced", 1)
+        return True, "✅ 그룹에 이벤트 시작 안내를 전송했습니다."
+
+    if not manual and (not event["announce_end"] or get_setting("group_end_notice_enabled", "1") != "1"):
+        return True, "마감 공지 OFF"
+    custom = get_setting("group_end_text", "").strip()
+    if custom:
+        text = html.escape(custom.replace("{event}", event["title"]).replace("{end}", fmt_kst(event["deadline_at"])))
+    else:
+        text = (
+            "🔒 <b>EVENT CLOSED</b>\n\n"
+            f"<b>{event_title_html(event)}</b> 참여가 마감되었습니다.\n\n"
+            "접수된 신청은 관리자 확인 후 순차적으로 처리됩니다."
+        )
+    try:
+        await application.bot.send_message(int(group_id), text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logger.exception("그룹 마감공지 실패")
+        return False, f"❌ 그룹 마감공지 실패: {type(exc).__name__}"
+    if not manual:
+        set_event_field(event_id, "end_announced", 1)
+    return True, "✅ 그룹에 이벤트 마감 안내를 전송했습니다."
+
+
+async def send_event_notice_media(bot, group_id: int, event: sqlite3.Row, text: str, markup):
+    if event["media_file_id"] and event["media_type"] == "animation":
+        await bot.send_animation(group_id, event["media_file_id"], caption=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    elif event["media_file_id"] and event["media_type"] == "photo":
+        await bot.send_photo(group_id, event["media_file_id"], caption=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    else:
+        await bot.send_message(group_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def scheduler_loop(application: Application):
+    await asyncio.sleep(3)
+    logger.info("KST 이벤트 스케줄러 시작")
+    while True:
+        try:
+            now = now_dt()
+            with db_connect() as conn:
+                rows = conn.execute("SELECT * FROM events WHERE status!='deleted'").fetchall()
+            for event in rows:
+                start = parse_kst(event["start_at"])
+                end = parse_kst(event["deadline_at"])
+
+                if start and now >= start and (not end or now <= end) and event["status"] in {"draft", "scheduled", "ended"}:
+                    start_event(event["id"], manual=False)
+                    event = get_event(event["id"])
+
+                if start and now >= start and (not end or now <= end) and not event["start_announced"]:
+                    if event["announce_start"] and get_setting("group_start_notice_enabled", "1") == "1":
+                        ok, _ = await send_group_notice(application, event["id"], "start", manual=False)
+                        if ok:
+                            set_event_field(event["id"], "start_announced", 1)
+
+                if end and now > end:
+                    if event["status"] != "ended":
+                        end_event(event["id"])
+                    if not event["end_announced"] and event["announce_end"] and get_setting("group_end_notice_enabled", "1") == "1":
+                        ok, _ = await send_group_notice(application, event["id"], "end", manual=False)
+                        if ok:
+                            set_event_field(event["id"], "end_announced", 1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("스케줄러 오류")
+        await asyncio.sleep(20)
+
+
+async def post_init(application: Application) -> None:
+    application.create_task(scheduler_loop(application), name="event_scheduler")
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return
+    args = context.args or []
+    if args and args[0].startswith("event_"):
+        try:
+            event_id = int(args[0].split("_", 1)[1])
+            event = get_event(event_id)
+            if event and event_is_open(event):
+                await send_event_card(context.bot, update.effective_chat.id, get_event(event_id), member_event_keyboard(get_event(event_id)))
+                return
+        except Exception:
+            pass
+    events = get_active_events()
+    if not events:
+        await update.effective_message.reply_text(no_event_card(), parse_mode=ParseMode.HTML, reply_markup=member_no_event_keyboard())
+        return
+    await update.effective_message.reply_text("<b>🎉 진행 중인 이벤트를 선택해주세요.</b>", parse_mode=ParseMode.HTML, reply_markup=member_event_list_keyboard(events))
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("관리자만 사용할 수 있습니다.")
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text("관리자 메뉴는 봇 개인채팅에서 /admin 으로 이용해주세요.")
+        return
+    context.user_data.clear()
+    await update.effective_message.reply_text("⚙️ <b>이벤트 관리자 메뉴</b>\n\n이벤트를 등록하거나 관리해주세요.", parse_mode=ParseMode.HTML, reply_markup=admin_home_keyboard())
+
+
+async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.effective_message.reply_text("등록할 그룹방에서 /setgroup 을 입력해주세요.")
+        return
+    set_setting("group_id", str(update.effective_chat.id))
+    set_setting("group_title", update.effective_chat.title or "그룹")
+    await update.effective_message.reply_text(
+        f"✅ 이 그룹을 이벤트 공지방으로 등록했습니다.\n\n그룹: {html.escape(update.effective_chat.title or '그룹')}\nID: <code>{update.effective_chat.id}</code>",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def photo_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V9.3 정상 작동 중")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(status_card(get_latest_user_application(update.effective_user.id)), parse_mode=ParseMode.HTML)
+
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     message = update.effective_message
-    application_id = context.user_data.get(
-        "collecting_application_id"
-    )
 
+    # 관리자 이벤트 대표 사진 등록 상태
+    if is_admin(user.id) and context.user_data.get("media_event_id"):
+        event_id = context.user_data["media_event_id"]
+        set_event_field(event_id, "media_file_id", message.photo[-1].file_id)
+        set_event_field(event_id, "media_type", "photo")
+        context.user_data.clear()
+        event = get_event(event_id)
+        await message.reply_text("✅ 이벤트 대표 이미지를 저장했습니다.", reply_markup=event_manage_keyboard(event))
+        return
+
+    application_id = context.user_data.get("collecting_application_id")
     if not application_id:
         with db_connect() as conn:
-            collecting = conn.execute(
-                """
-                SELECT id
-                FROM applications_v6
-                WHERE user_id = ? AND status = 'collecting'
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (user.id,),
-            ).fetchone()
-        application_id = collecting["id"] if collecting else None
-
+            row = conn.execute("SELECT id FROM applications_v6 WHERE user_id=? AND status='collecting' ORDER BY id DESC LIMIT 1", (user.id,)).fetchone()
+        application_id = row["id"] if row else None
     if not application_id:
-        await message.reply_text(
-            "먼저 진행 중인 이벤트를 선택하고 참여 신청 버튼을 눌러주세요."
-        )
         return
 
-    application = get_application(application_id)
-
-    if (
-        not application
-        or application["user_id"] != user.id
-        or application["status"] != "collecting"
-    ):
+    approw = get_application(application_id)
+    if not approw or approw["user_id"] != user.id or approw["status"] != "collecting":
         context.user_data.pop("collecting_application_id", None)
-        await message.reply_text(
-            "진행 중인 사진 인증 신청을 찾을 수 없습니다."
-        )
         return
-
-    added = add_application_photo(
-        application_id,
-        message.photo[-1].file_id,
-    )
-
+    event = get_event(approw["event_id"])
+    if not event or not event_is_open(event):
+        await message.reply_text("🔒 이벤트가 마감되어 더 이상 인증사진을 등록할 수 없습니다.")
+        return
+    max_photos = max(1, min(int(event["max_photos"] or 10), 10))
+    added = add_application_photo(application_id, message.photo[-1].file_id, max_photos)
     count = application_photo_count(application_id)
-
     if not added:
-        await message.reply_text(
-            "인증사진은 최대 5장까지 등록할 수 있습니다.",
-            reply_markup=submission_keyboard(application_id),
-        )
+        await message.reply_text(f"인증사진은 최대 {max_photos}장까지 등록할 수 있습니다.", reply_markup=submission_keyboard(application_id))
         return
-
-    await message.reply_text(
-        f"📸 인증사진이 등록되었습니다.\n\n"
-        f"현재 등록: {count}/5장\n\n"
-        "사진을 더 보내거나 제출 완료를 눌러주세요.",
-        reply_markup=submission_keyboard(application_id),
-    )
+    await message.reply_text(f"📸 인증사진이 등록되었습니다.\n\n현재 등록: {count}/{max_photos}장\n\n사진을 더 보내거나 인증 제출을 눌러주세요.", reply_markup=submission_keyboard(application_id))
 
 
-async def send_application_to_admin(
-    context: ContextTypes.DEFAULT_TYPE,
-    application: sqlite3.Row,
-    photos: list[str],
-) -> None:
-    event = get_event(application["event_id"])
+async def animation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    event_id = context.user_data.get("media_event_id")
+    if not event_id:
+        return
+    set_event_field(event_id, "media_file_id", update.effective_message.animation.file_id)
+    set_event_field(event_id, "media_type", "animation")
+    context.user_data.clear()
+    await update.effective_message.reply_text("✅ 이벤트 대표 GIF를 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id)))
 
+
+async def send_application_to_admin(context: ContextTypes.DEFAULT_TYPE, application: sqlite3.Row, photos: list[str]) -> None:
+    proof = PROOF_TEXT.get(application["proof_type"], application["proof_type"] or "-")
     media = []
-
-    for index, file_id in enumerate(photos):
+    for i, file_id in enumerate(photos):
         caption = None
-
-        if index == 0:
+        if i == 0:
             caption = (
                 "📩 <b>이벤트 참가 신청</b>\n\n"
                 f"{CARD_LINE}\n\n"
-                f"<b>🎉 이벤트</b>\n"
-                f"{html.escape(application['event_title'])}\n\n"
-                f"<b>📌 신청번호</b>\n"
-                f"<code>#{application['id']}</code>\n\n"
-                f"<b>👤 회원</b>\n"
-                f"{html.escape(application['name'] or '이름 없음')}\n\n"
-                f"<b>🔗 아이디</b>\n"
-                f"{html.escape(application['username'] or '없음')}\n\n"
-                f"<b>🆔 숫자 ID</b>\n"
-                f"<code>{application['user_id']}</code>\n\n"
-                f"<b>📸 인증사진</b>\n"
-                f"{len(photos)}장\n\n"
-                f"{CARD_LINE}"
+                f"<b>🎉 이벤트</b>\n{html.escape(application['event_title'])}\n\n"
+                f"<b>📌 신청번호</b>\n<code>#{application['id']}</code>\n\n"
+                f"<b>👤 회원</b>\n{html.escape(application['name'] or '이름 없음')}\n\n"
+                f"<b>🔗 아이디</b>\n{html.escape(application['username'] or '없음')}\n\n"
+                f"<b>🆔 숫자 ID</b>\n<code>{application['user_id']}</code>\n\n"
+                f"<b>📸 인증방식</b>\n{html.escape(proof)}\n\n"
+                f"<b>📸 인증사진</b>\n{len(photos)}장\n\n{CARD_LINE}"
             )
-
-        media.append(
-            InputMediaPhoto(
-                media=file_id,
-                caption=caption,
-                parse_mode=(
-                    ParseMode.HTML
-                    if caption
-                    else None
-                ),
-            )
-        )
-
-    await context.bot.send_media_group(
-        chat_id=ADMIN_ID,
-        media=media,
-    )
-
+        media.append(InputMediaPhoto(media=file_id, caption=caption, parse_mode=ParseMode.HTML if caption else None))
+    await context.bot.send_media_group(chat_id=ADMIN_ID, media=media)
     await context.bot.send_message(
         chat_id=ADMIN_ID,
-        text=(
-            f"📋 신청 #{application['id']} 처리\n\n"
-            f"회원 ID: <code>{application['user_id']}</code>"
-        ),
+        text=f"📋 신청 #{application['id']} 처리\n\n회원 ID: <code>{application['user_id']}</code>",
         parse_mode=ParseMode.HTML,
-        reply_markup=admin_application_keyboard(
-            application["id"]
-        ),
+        reply_markup=admin_application_keyboard(application["id"]),
     )
 
 
-async def send_pending(
-    message,
-    event_id: Optional[int] = None,
-) -> None:
+async def send_pending(message, event_id: Optional[int] = None) -> None:
     with db_connect() as conn:
         if event_id is None:
-            rows = conn.execute(
-                """
-                SELECT * FROM applications_v6
-                WHERE status = 'pending'
-                ORDER BY id DESC LIMIT 50
-                """
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM applications_v6 WHERE status='pending' ORDER BY id DESC LIMIT 50").fetchall()
         else:
-            rows = conn.execute(
-                """
-                SELECT * FROM applications_v6
-                WHERE status = 'pending' AND event_id = ?
-                ORDER BY id DESC LIMIT 50
-                """,
-                (event_id,),
-            ).fetchall()
-
-    event = get_event(event_id) if event_id else None
-    back = event_manage_keyboard(event) if event else admin_home_keyboard()
-
+            rows = conn.execute("SELECT * FROM applications_v6 WHERE status='pending' AND event_id=? ORDER BY id DESC LIMIT 50", (event_id,)).fetchall()
     if not rows:
-        await message.reply_text("📭 승인 대기 신청이 없습니다.", reply_markup=back)
+        await message.reply_text("📭 승인 대기 신청이 없습니다.", reply_markup=event_manage_keyboard(get_event(event_id)) if event_id else admin_home_keyboard())
         return
-
-    lines = ["📋 <b>승인 대기 목록</b>\\n"]
+    lines = ["📋 <b>승인 대기 목록</b>\n"]
     for row in rows:
-        lines.append(
-            f"📌 #{row['id']} / {html.escape(row['event_title'])}\\n"
-            f"👤 {html.escape(row['name'] or '-')}\\n"
-            f"🆔 <code>{row['user_id']}</code>\\n"
-            f"📸 {application_photo_count(row['id'])}장\\n"
-            "──────────────"
-        )
-
-    await message.reply_text(
-        "\n".join(lines)[:4000],
-        parse_mode=ParseMode.HTML,
-        reply_markup=back,
-    )
+        lines.append(f"📌 #{row['id']} / {html.escape(row['event_title'])}\n👤 {html.escape(row['name'] or '-')}\n🆔 <code>{row['user_id']}</code>\n📸 {application_photo_count(row['id'])}장\n──────────────")
+    await message.reply_text("\n".join(lines)[:4000], parse_mode=ParseMode.HTML, reply_markup=event_manage_keyboard(get_event(event_id)) if event_id else admin_home_keyboard())
 
 
-async def send_stats(
-    message,
-    event_id: Optional[int] = None,
-) -> None:
-    event = get_event(event_id) if event_id else None
-
+async def send_stats(message, event_id: Optional[int] = None) -> None:
     with db_connect() as conn:
         if event_id is None:
-            rows = conn.execute(
-                "SELECT status, COUNT(*) AS count FROM applications_v6 GROUP BY status"
-            ).fetchall()
+            rows = conn.execute("SELECT status,COUNT(*) count FROM applications_v6 GROUP BY status").fetchall()
         else:
-            rows = conn.execute(
-                """
-                SELECT status, COUNT(*) AS count
-                FROM applications_v6
-                WHERE event_id = ?
-                GROUP BY status
-                """,
-                (event_id,),
-            ).fetchall()
-
-    counts = {
-        "collecting": 0,
-        "pending": 0,
-        "approved": 0,
-        "rejected": 0,
-        "notify_failed": 0,
-    }
+            rows = conn.execute("SELECT status,COUNT(*) count FROM applications_v6 WHERE event_id=? GROUP BY status", (event_id,)).fetchall()
+    counts = {k: 0 for k in STATUS_TEXT}
     for row in rows:
         counts[row["status"]] = row["count"]
-
+    event = get_event(event_id) if event_id else None
     await message.reply_text(
-        "📊 <b>이벤트 신청 현황</b>\\n\\n"
-        f"🎉 {event_title_html(event) if event else '전체 이벤트'}\\n\\n"
-        f"📸 사진 등록 중 : {counts['collecting']}건\\n"
-        f"⏳ 승인 대기 : {counts['pending']}건\\n"
-        f"✅ 승인 : {counts['approved']}건\\n"
-        f"❌ 거절 : {counts['rejected']}건\\n"
-        f"⚠️ 전달 실패 : {counts['notify_failed']}건",
+        "📊 <b>이벤트 신청 현황</b>\n\n"
+        f"🎉 {event_title_html(event) if event else '전체 이벤트'}\n\n"
+        f"📸 사진 등록 중 : {counts.get('collecting',0)}건\n"
+        f"⏳ 승인 대기 : {counts.get('pending',0)}건\n"
+        f"✅ 승인 : {counts.get('approved',0)}건\n"
+        f"❌ 거절 : {counts.get('rejected',0)}건\n"
+        f"⚠️ 전달 실패 : {counts.get('notify_failed',0)}건",
         parse_mode=ParseMode.HTML,
         reply_markup=event_manage_keyboard(event) if event else admin_home_keyboard(),
     )
 
 
-async def callback_handler_impl(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-
     if not query:
         return
-
     try:
         await query.answer()
     except BadRequest:
         pass
-
     data = query.data or ""
 
+    # ---------------- 회원 ----------------
     if data.startswith("user:"):
         parts = data.split(":")
         action = parts[1]
-
         if action == "status":
-            await query.message.reply_text(
-                status_card(
-                    get_latest_user_application(
-                        query.from_user.id
-                    )
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=member_no_event_keyboard(),
-            )
+            await query.message.reply_text(status_card(get_latest_user_application(query.from_user.id)), parse_mode=ParseMode.HTML, reply_markup=member_no_event_keyboard())
             return
-
         if action == "event_list":
             events = get_active_events()
-            await query.edit_message_text(
-                active_events_card(events),
-                parse_mode=ParseMode.HTML,
-                reply_markup=(
-                    member_event_list_keyboard(events)
-                    if events else member_no_event_keyboard()
-                ),
-            )
+            await query.edit_message_text("<b>🎉 진행 중인 이벤트를 선택해주세요.</b>" if events else no_event_card(), parse_mode=ParseMode.HTML, reply_markup=member_event_list_keyboard(events) if events else member_no_event_keyboard())
             return
-
         if action == "event":
             event_id = int(parts[2])
             event = get_event(event_id)
-
             if not event or not event_is_open(event):
-                await query.answer(
-                    "현재 진행 중인 이벤트가 아닙니다.",
-                    show_alert=True,
-                )
+                await query.answer("현재 진행 중인 이벤트가 아닙니다.", show_alert=True)
                 return
-
-            await query.edit_message_text(
-                event_card(event),
-                parse_mode=ParseMode.HTML,
-                reply_markup=member_event_keyboard(event_id),
-            )
+            await send_event_card(context.bot, query.from_user.id, get_event(event_id), member_event_keyboard(get_event(event_id)))
             return
-
         if action == "apply":
             event_id = int(parts[2])
             event = get_event(event_id)
-            if (
-                not event
-                or not event_is_open(event)
-            ):
-                await query.message.reply_text(
-                    no_event_card(),
-                    parse_mode=ParseMode.HTML,
-                )
+            if not event or not event_is_open(event):
+                await query.message.reply_text(no_event_card(), parse_mode=ParseMode.HTML)
                 return
-
-            existing = get_user_event_application(
-                event_id,
-                query.from_user.id,
-            )
-
-            if existing and existing["status"] in {
-                "collecting",
-                "pending",
-                "approved",
-            }:
-                await query.message.reply_text(
-                    status_card(existing),
-                    parse_mode=ParseMode.HTML,
-                )
+            existing = get_user_event_application(event_id, query.from_user.id)
+            if existing and existing["status"] in {"collecting", "pending", "approved"}:
+                await query.message.reply_text(status_card(existing), parse_mode=ParseMode.HTML)
                 return
-
-            application_id = create_application(
-                event,
-                query.from_user,
-            )
-
-            context.user_data[
-                "collecting_application_id"
-            ] = application_id
-
-            await query.message.reply_text(
-                event_card(event)
-                + (
-                    "\n\n<b>📸 인증사진 등록</b>\n"
-                    "인증사진을 1장부터 최대 5장까지 보내주세요.\n"
-                    "사진 등록이 끝나면 `사진 제출 완료`를 눌러주세요."
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=submission_keyboard(application_id),
-            )
+            await query.message.reply_text("📸 <b>인증 방식을 선택해주세요.</b>", parse_mode=ParseMode.HTML, reply_markup=proof_keyboard(event_id, event["proof_mode"]))
             return
 
-    if data.startswith("submit:"):
-        _, action, application_id_text = data.split(":")
-        application_id = int(application_id_text)
-        application = get_application(application_id)
-
-        if (
-            not application
-            or application["user_id"] != query.from_user.id
-            or application["status"] != "collecting"
-        ):
-            await query.answer(
-                "처리할 수 없는 신청입니다.",
-                show_alert=True,
-            )
+    if data.startswith("proof:"):
+        _, proof_type, event_id_text = data.split(":")
+        event_id = int(event_id_text)
+        event = get_event(event_id)
+        if not event or not event_is_open(event):
+            await query.answer("이벤트가 마감되었습니다.", show_alert=True)
             return
-
-        if action == "cancel":
-            delete_application(application_id)
-            context.user_data.pop(
-                "collecting_application_id",
-                None,
-            )
-
-            await query.edit_message_text(
-                "🗑 이벤트 참가 신청을 취소했습니다."
-            )
+        if proof_type not in {"chat", "partner"} or (event["proof_mode"] == "chat" and proof_type != "chat") or (event["proof_mode"] == "partner" and proof_type != "partner"):
+            await query.answer("선택할 수 없는 인증 방식입니다.", show_alert=True)
             return
-
-        photos = get_application_photos(application_id)
-
-        if not 1 <= len(photos) <= 5:
-            await query.answer(
-                "인증사진을 1장 이상 등록해주세요.",
-                show_alert=True,
-            )
-            return
-
-        try:
-            await send_application_to_admin(
-                context,
-                application,
-                photos,
-            )
-        except Exception:
-            logger.exception(
-                "관리자 신청 전달 실패 application_id=%s",
-                application_id,
-            )
-            set_application_status(
-                application_id,
-                "notify_failed",
-            )
-            await query.message.reply_text(
-                "⚠️ 담당자에게 신청을 전달하지 못했습니다.\n"
-                "잠시 후 다시 신청해주세요."
-            )
-            return
-
-        set_application_status(
-            application_id,
-            "pending",
-        )
-        context.user_data.pop(
-            "collecting_application_id",
-            None,
-        )
-
-        await query.edit_message_text(
-            "📨 <b>참가 신청이 접수되었습니다.</b>\n\n"
-            f"신청번호 : <code>#{application_id}</code>\n"
-            f"인증사진 : {len(photos)}장\n\n"
-            "관리자 확인 후 결과를 안내드립니다.",
+        application_id = create_application(event, query.from_user, proof_type)
+        context.user_data["collecting_application_id"] = application_id
+        label = PROOF_TEXT[proof_type]
+        await query.message.reply_text(
+            f"📸 <b>{html.escape(label)}</b>\n\n인증 캡처본을 보내주세요.\n사진은 <b>1장~{event['max_photos']}장</b>까지 가능합니다.\n\n사진을 모두 보낸 뒤 <b>인증 제출</b>을 눌러주세요.",
             parse_mode=ParseMode.HTML,
+            reply_markup=submission_keyboard(application_id),
         )
         return
 
+    if data.startswith("submit:"):
+        _, action, aid = data.split(":")
+        application_id = int(aid)
+        approw = get_application(application_id)
+        if not approw or approw["user_id"] != query.from_user.id or approw["status"] != "collecting":
+            await query.answer("처리할 수 없는 신청입니다.", show_alert=True)
+            return
+        if action == "cancel":
+            delete_application(application_id)
+            context.user_data.pop("collecting_application_id", None)
+            await query.edit_message_text("🗑 이벤트 참가 신청을 취소했습니다.")
+            return
+        event = get_event(approw["event_id"])
+        if not event or not event_is_open(event):
+            await query.answer("이벤트가 마감되어 제출할 수 없습니다.", show_alert=True)
+            return
+        photos = get_application_photos(application_id)
+        if not photos:
+            await query.answer("인증사진을 1장 이상 등록해주세요.", show_alert=True)
+            return
+        try:
+            await send_application_to_admin(context, approw, photos)
+        except Exception:
+            logger.exception("관리자 신청 전달 실패 application_id=%s", application_id)
+            set_application_status(application_id, "notify_failed")
+            await query.message.reply_text("⚠️ 담당자에게 신청을 전달하지 못했습니다. 잠시 후 다시 신청해주세요.")
+            return
+        set_application_status(application_id, "pending")
+        context.user_data.pop("collecting_application_id", None)
+        await query.edit_message_text(f"📨 <b>참가 신청이 접수되었습니다.</b>\n\n신청번호 : <code>#{application_id}</code>\n인증사진 : {len(photos)}장\n\n관리자 확인 후 결과를 안내드립니다.", parse_mode=ParseMode.HTML)
+        return
+
+    # ---------------- 관리자 ----------------
     if not is_admin(query.from_user.id):
-        await query.answer(
-            "관리자만 사용할 수 있습니다.",
-            show_alert=True,
-        )
+        await query.answer("관리자만 사용할 수 있습니다.", show_alert=True)
         return
 
     if data == "admin:home":
         context.user_data.clear()
-
-        await query.edit_message_text(
-            "⚙️ <b>이벤트 관리자 메뉴</b>\n\n"
-            "이벤트를 등록하거나 관리해주세요.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_home_keyboard(),
-        )
+        await query.edit_message_text("⚙️ <b>이벤트 관리자 메뉴</b>\n\n이벤트를 등록하거나 관리해주세요.", parse_mode=ParseMode.HTML, reply_markup=admin_home_keyboard())
         return
-
     if data == "admin:close":
         context.user_data.clear()
-        await query.edit_message_text(
-            "관리자 메뉴를 닫았습니다."
-        )
+        await query.edit_message_text("관리자 메뉴를 닫았습니다.")
         return
-
-    if data == "admin:status_emoji":
-        context.user_data.clear()
-        context.user_data["edit_status_button_emoji"] = True
-
-        current = get_v8_setting("status_button_emoji", "")
-
-        await query.edit_message_text(
-            "<b>내 신청 상태 버튼 이모지</b>\n\n"
-            "버튼 앞에 표시할 일반 이모지 하나를 보내주세요.\n"
-            "제거하려면 <code>없음</code>이라고 입력하세요.\n\n"
-            f"현재 설정: {html.escape(current or '없음')}\n\n"
-            "일반 이모지와 프리미엄 커스텀 이모지를 모두 등록할 수 있습니다.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⬅ 관리자 메뉴",
-                        callback_data="admin:home",
-                    )
-                ]
-            ]),
-        )
-        return
-
     if data == "admin:event_list":
-        await query.edit_message_text(
-            "📚 <b>전체 이벤트 관리</b>\n\n"
-            "관리할 이벤트를 선택해주세요.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_event_list_keyboard(),
-        )
+        await query.edit_message_text("📚 <b>전체 이벤트 관리</b>\n\n관리할 이벤트를 선택해주세요.", parse_mode=ParseMode.HTML, reply_markup=admin_event_list_keyboard())
         return
-
     if data == "admin:new_event":
         event_id = create_event()
         event = get_event(event_id)
-
-        await query.edit_message_text(
-            event_card(event, admin=True),
-            parse_mode=ParseMode.HTML,
-            reply_markup=event_manage_keyboard(event),
-        )
+        await query.edit_message_text(event_card(event, admin=True), parse_mode=ParseMode.HTML, reply_markup=event_manage_keyboard(event))
         return
-
     if data == "admin:pending":
         await send_pending(query.message)
         return
-
     if data == "admin:stats":
         await send_stats(query.message)
         return
-
-    if data.startswith("deadline:"):
-        _, action, event_id_text = data.split(":")
-        event_id = int(event_id_text)
-        event = get_event(event_id)
-
-        if not event:
-            return
-
-        if action == "set":
-            context.user_data.clear()
-            context.user_data["edit_deadline_event_id"] = event_id
-
-            await query.edit_message_text(
-                "<b>참여 마감시간 설정</b>\n\n"
-                "다음 형식으로 입력해주세요.\n"
-                "<code>YYYY-MM-DD HH:MM</code>\n\n"
-                "예: <code>2026-07-31 23:30</code>\n"
-                "마감시간을 없애려면 <code>없음</code>이라고 입력하세요.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=edit_back_keyboard(event_id),
-            )
-            return
-
-    if data.startswith("emoji:"):
-        _, action, event_id_text = data.split(":")
-        event_id = int(event_id_text)
-        event = get_event(event_id)
-
-        if not event:
-            return
-
-        if action == "menu":
-            await query.edit_message_text(
-                "<b>이모지 설정</b>\n\n"
-                "항목을 선택한 뒤 일반 이모지 또는 "
-                "텔레그램 프리미엄 이모지 하나를 보내주세요.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=emoji_manage_keyboard(event_id),
-            )
-            return
-
-        if action == "clear":
-            with db_connect() as conn:
-                conn.execute(
-                    """
-                    UPDATE events
-                    SET emoji_title = '',
-                        emoji_content = '',
-                        emoji_time = '',
-                        emoji_deadline = '',
-                        emoji_conditions = '',
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (now_kst(), event_id),
-                )
-
-            await query.edit_message_text(
-                "모든 항목 이모지를 제거했습니다.",
-                reply_markup=emoji_manage_keyboard(event_id),
-            )
-            return
-
-    if data.startswith("emoji_edit:"):
-        _, field, event_id_text = data.split(":")
-        event_id = int(event_id_text)
-
-        context.user_data.clear()
-        context.user_data["edit_emoji_event_id"] = event_id
-        context.user_data["edit_emoji_field"] = field
-
+    if data == "admin:status_emoji":
+        context.user_data.clear(); context.user_data["edit_status_button_emoji"] = True
+        await query.edit_message_text("<b>내 신청 상태 버튼 이모지</b>\n\n일반 이모지 또는 프리미엄 이모지 하나를 보내주세요.\n제거하려면 <code>없음</code> 입력.", parse_mode=ParseMode.HTML, reply_markup=admin_home_keyboard())
+        return
+    if data == "admin:group":
+        title = get_setting("group_title", "미등록") or "미등록"
+        gid = get_setting("group_id", "미등록") or "미등록"
         await query.edit_message_text(
-            "<b>이모지 등록</b>\n\n"
-            "사용할 이모지 하나를 보내주세요.\n"
-            "이모지를 없애려면 <code>없음</code>이라고 입력하세요.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=emoji_manage_keyboard(event_id),
-        )
+            "🔗 <b>그룹/공지 설정</b>\n\n"
+            f"현재 그룹 : {html.escape(title)}\nID : <code>{html.escape(gid)}</code>\n\n"
+            "그룹 등록: 봇을 그룹에 추가한 뒤 관리자 계정으로 <code>/setgroup</code>\n\n"
+            f"전체 시작공지 : {'ON' if get_setting('group_start_notice_enabled','1')=='1' else 'OFF'}\n"
+            f"전체 마감공지 : {'ON' if get_setting('group_end_notice_enabled','1')=='1' else 'OFF'}",
+            parse_mode=ParseMode.HTML, reply_markup=group_settings_keyboard())
+        return
+
+    if data.startswith("group:"):
+        action = data.split(":")[1]
+        if action == "toggle_start":
+            set_setting("group_start_notice_enabled", "0" if get_setting("group_start_notice_enabled", "1") == "1" else "1")
+        elif action == "toggle_end":
+            set_setting("group_end_notice_enabled", "0" if get_setting("group_end_notice_enabled", "1") == "1" else "1")
+        elif action == "text_start":
+            context.user_data.clear(); context.user_data["edit_group_text"] = "start"
+            await query.edit_message_text("시작 공지 문구를 입력해주세요.\n\n변수: <code>{event}</code> <code>{start}</code> <code>{end}</code>\n기본문구로 되돌리려면 <code>기본</code>", parse_mode=ParseMode.HTML, reply_markup=group_settings_keyboard()); return
+        elif action == "text_end":
+            context.user_data.clear(); context.user_data["edit_group_text"] = "end"
+            await query.edit_message_text("마감 공지 문구를 입력해주세요.\n\n변수: <code>{event}</code> <code>{end}</code>\n기본문구로 되돌리려면 <code>기본</code>", parse_mode=ParseMode.HTML, reply_markup=group_settings_keyboard()); return
+        await query.edit_message_text("✅ 그룹 공지 설정을 변경했습니다.", reply_markup=group_settings_keyboard())
         return
 
     if data.startswith("event:"):
         _, action, event_id_text = data.split(":")
         event_id = int(event_id_text)
         event = get_event(event_id)
-
         if not event:
-            await query.message.reply_text(
-                "이벤트를 찾을 수 없습니다.",
-                reply_markup=admin_home_keyboard(),
-            )
             return
-
-        if action == "pending":
-            await send_pending(query.message, event_id)
-            return
-
-        if action == "stats":
-            await send_stats(query.message, event_id)
-            return
-
         if action == "manage":
-            await query.edit_message_text(
-                event_card(event, admin=True),
-                parse_mode=ParseMode.HTML,
-                reply_markup=event_manage_keyboard(event),
-            )
-            return
-
+            await query.edit_message_text(event_card(event, admin=True), parse_mode=ParseMode.HTML, reply_markup=event_manage_keyboard(event)); return
         if action == "preview":
-            await query.message.reply_text(
-                event_card(event),
-                parse_mode=ParseMode.HTML,
-                reply_markup=edit_back_keyboard(event_id),
-            )
-            return
-
+            await send_event_card(context.bot, query.from_user.id, event, simple_back(event_id)); return
+        if action == "pending":
+            await send_pending(query.message, event_id); return
+        if action == "stats":
+            await send_stats(query.message, event_id); return
         if action == "start":
             start_event(event_id)
             event = get_event(event_id)
-
-            await query.edit_message_text(
-                event_card(event, admin=True)
-                + "\n\n✅ 회원 신청이 가능하도록 시작했습니다.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=event_manage_keyboard(event),
-            )
-            return
-
+            await query.edit_message_text(event_card(event, admin=True)+"\n\n✅ 회원 신청이 가능하도록 시작했습니다.", parse_mode=ParseMode.HTML, reply_markup=event_manage_keyboard(event)); return
         if action == "end":
             end_event(event_id)
             event = get_event(event_id)
-
-            await query.edit_message_text(
-                event_card(event, admin=True)
-                + "\n\n🛑 이벤트를 종료했습니다.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=event_manage_keyboard(event),
-            )
-            return
-
+            await query.edit_message_text(event_card(event, admin=True)+"\n\n🛑 이벤트를 종료했습니다.", parse_mode=ParseMode.HTML, reply_markup=event_manage_keyboard(event)); return
         if action == "delete_confirm":
-            await query.edit_message_text(
-                "🗑 <b>이벤트 삭제 확인</b>\n\n"
-                f"{event_title_html(event)}\n\n"
-                "이벤트만 삭제하며 기존 신청 기록은 유지됩니다.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=delete_confirm_keyboard(event_id),
-            )
-            return
-
+            await query.edit_message_text("🗑 <b>이벤트 삭제 확인</b>\n\n기존 신청 기록은 유지됩니다.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 정말 삭제", callback_data=f"event:delete:{event_id}")],[InlineKeyboardButton("⬅ 취소", callback_data=f"event:manage:{event_id}")]])); return
         if action == "delete":
-            if event["status"] == "active":
-                await query.answer(
-                    "진행 중인 이벤트는 먼저 종료해주세요.",
-                    show_alert=True,
-                )
-                return
-
             delete_event(event_id)
-
-            await query.edit_message_text(
-                "✅ 이벤트를 삭제했습니다.\n"
-                "기존 신청 기록은 보존됩니다.",
-                reply_markup=admin_home_keyboard(),
-            )
-            return
+            await query.edit_message_text("🗑 이벤트를 삭제했습니다.", reply_markup=admin_event_list_keyboard()); return
 
     if data.startswith("edit:"):
         _, field, event_id_text = data.split(":")
         event_id = int(event_id_text)
+        labels = {"title":"이벤트명", "content":"이벤트 내용", "participation_time":"참가시간 문구", "conditions":"참여조건", "approval":"승인문구", "rejection":"거절문구"}
+        context.user_data.clear(); context.user_data["edit_event_id"] = event_id; context.user_data["edit_event_field"] = field
+        await query.edit_message_text(f"<b>{labels.get(field,field)} 수정</b>\n\n새 내용을 보내주세요. 일반/프리미엄 이모지도 사용할 수 있습니다.", parse_mode=ParseMode.HTML, reply_markup=simple_back(event_id)); return
 
-        labels = {
-            "title": "이벤트명",
-            "content": "이벤트 내용",
-            "participation_time": "참가시간",
-            "conditions": "참여조건",
-            "approval": "승인문구",
-            "rejection": "거절문구",
-        }
+    if data.startswith("schedule:"):
+        _, which, event_id_text = data.split(":")
+        event_id = int(event_id_text)
+        context.user_data.clear(); context.user_data["schedule_event_id"] = event_id; context.user_data["schedule_which"] = which
+        label = "자동 시작시간" if which == "start" else "마감시간"
+        await query.edit_message_text(f"<b>{label} 설정</b>\n\n한국시간 기준 <code>YYYY-MM-DD HH:MM</code> 형식으로 입력해주세요.\n예: <code>2026-08-07 18:00</code>\n\n자동 시작을 없애려면 <code>없음</code> 입력.", parse_mode=ParseMode.HTML, reply_markup=simple_back(event_id)); return
 
-        context.user_data.clear()
-        context.user_data["edit_event_id"] = event_id
-        context.user_data["edit_event_field"] = field
+    if data.startswith("proofmode:"):
+        _, _, event_id_text = data.split(":")
+        event_id = int(event_id_text)
+        await query.edit_message_text("📸 <b>인증 방식을 선택해주세요.</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 채팅 + 🤝 제휴 둘 다", callback_data=f"proofset:both:{event_id}")],
+            [InlineKeyboardButton("💬 당일 채팅만", callback_data=f"proofset:chat:{event_id}")],
+            [InlineKeyboardButton("🤝 당일 제휴만", callback_data=f"proofset:partner:{event_id}")],
+            [InlineKeyboardButton("⬅ 이벤트 관리", callback_data=f"event:manage:{event_id}")],
+        ])); return
 
-        await query.edit_message_text(
-            f"✏️ <b>{labels[field]} 수정</b>\n\n"
-            "새 내용을 보내주세요.\n"
-            "프리미엄 이모지와 줄바꿈도 그대로 저장됩니다.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=edit_back_keyboard(event_id),
-        )
-        return
+    if data.startswith("proofset:"):
+        _, mode, event_id_text = data.split(":")
+        event_id = int(event_id_text); set_event_field(event_id, "proof_mode", mode)
+        await query.edit_message_text("✅ 인증 방식을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id))); return
+
+    if data.startswith("media:"):
+        _, action, event_id_text = data.split(":")
+        event_id = int(event_id_text)
+        if action == "set":
+            context.user_data.clear(); context.user_data["media_event_id"] = event_id
+            await query.edit_message_text("🖼 대표 사진 또는 GIF를 보내주세요.\n\n제거하려면 아래 버튼을 누르세요.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 대표미디어 제거", callback_data=f"media:clear:{event_id}")],[InlineKeyboardButton("⬅ 이벤트 관리", callback_data=f"event:manage:{event_id}")]])); return
+        if action == "clear":
+            set_event_field(event_id,"media_file_id",""); set_event_field(event_id,"media_type","")
+            context.user_data.clear(); await query.edit_message_text("✅ 대표미디어를 제거했습니다.", reply_markup=event_manage_keyboard(get_event(event_id))); return
+
+    if data.startswith("toggle:"):
+        _, which, event_id_text = data.split(":")
+        event_id = int(event_id_text); event = get_event(event_id)
+        field = "announce_start" if which == "start_notice" else "announce_end"
+        set_event_field(event_id, field, 0 if event[field] else 1)
+        await query.edit_message_text(event_card(get_event(event_id), admin=True), parse_mode=ParseMode.HTML, reply_markup=event_manage_keyboard(get_event(event_id))); return
+
+    if data.startswith("announce:"):
+        _, kind, event_id_text = data.split(":")
+        ok, msg = await send_group_notice(context.application, int(event_id_text), kind, manual=True)
+        await query.message.reply_text(msg, reply_markup=event_manage_keyboard(get_event(int(event_id_text)))); return
+
+    if data.startswith("emoji:"):
+        _, action, event_id_text = data.split(":")
+        event_id = int(event_id_text)
+        if action == "menu":
+            await query.edit_message_text("<b>이모지 설정</b>\n\n항목을 선택한 뒤 일반 이모지 또는 텔레그램 프리미엄 이모지 하나를 보내주세요.", parse_mode=ParseMode.HTML, reply_markup=emoji_manage_keyboard(event_id)); return
+        if action == "clear":
+            with db_connect() as conn:
+                conn.execute("UPDATE events SET emoji_title='',emoji_title_id='',emoji_content='',emoji_time='',emoji_deadline='',emoji_conditions='',updated_at=? WHERE id=?", (now_kst(), event_id)); conn.commit()
+            await query.edit_message_text("모든 항목 이모지를 제거했습니다.", reply_markup=emoji_manage_keyboard(event_id)); return
+
+    if data.startswith("emoji_edit:"):
+        _, field, event_id_text = data.split(":")
+        event_id = int(event_id_text)
+        context.user_data.clear(); context.user_data["edit_emoji_event_id"] = event_id; context.user_data["edit_emoji_field"] = field
+        await query.edit_message_text("<b>이모지 등록</b>\n\n사용할 이모지 하나를 보내주세요.\n없애려면 <code>없음</code> 입력.", parse_mode=ParseMode.HTML, reply_markup=emoji_manage_keyboard(event_id)); return
 
     if data.startswith("application:"):
-        _, action, application_id_text = data.split(":")
-        application_id = int(application_id_text)
-        application = get_application(application_id)
-
-        if not application:
-            await query.answer(
-                "신청 내역을 찾을 수 없습니다.",
-                show_alert=True,
-            )
-            return
-
-        if application["status"] in {
-            "approved",
-            "rejected",
-        }:
-            await query.answer(
-                "이미 처리된 신청입니다.",
-                show_alert=True,
-            )
-            return
-
-        event = get_event(application["event_id"])
-
+        _, action, aid = data.split(":")
+        application_id = int(aid); approw = get_application(application_id)
+        if not approw:
+            await query.answer("신청 내역을 찾을 수 없습니다.", show_alert=True); return
+        if approw["status"] in {"approved", "rejected"}:
+            await query.answer("이미 처리된 신청입니다.", show_alert=True); return
         if action == "approve":
-            status = "approved"
-            result = "✅ 참가 승인 완료"
-            member_text = (
-                event["approval_html"]
-                if event
-                else "✅ 참가승인이 되었습니다."
-            )
-        else:
-            status = "rejected"
-            result = "❌ 참가 거절 완료"
-            member_text = (
-                event["rejection_html"]
-                if event
-                else "❌ 참가신청이 거절되었습니다."
-            )
+            event = get_event(approw["event_id"])
+            set_application_status(application_id, "approved", query.from_user.id)
+            member_text = event["approval_html"] if event and event["approval_html"] else "✅ 참가승인이 되었습니다."
+            try:
+                await context.bot.send_message(approw["user_id"], member_text, parse_mode=ParseMode.HTML)
+            except Exception:
+                logger.exception("회원 승인 알림 실패")
+            await query.edit_message_text(f"✅ 참가 승인 완료\n\n신청번호 : #{application_id}\n회원 ID : {approw['user_id']}\n처리시간 : {now_kst()}"); return
+        await query.edit_message_text(f"❌ 신청 #{application_id} 거절 사유를 선택해주세요.", reply_markup=reject_reason_keyboard(application_id)); return
 
-        set_application_status(
-            application_id,
-            status,
-            query.from_user.id,
-        )
+    if data.startswith("reject:"):
+        _, reason_key, aid = data.split(":")
+        application_id = int(aid)
+        if reason_key == "custom":
+            context.user_data.clear(); context.user_data["reject_custom_id"] = application_id
+            await query.edit_message_text("거절 사유를 직접 입력해주세요."); return
+        await finish_reject(context, application_id, REJECT_REASONS.get(reason_key, "관리자 확인 결과 거절되었습니다."), query.from_user.id)
+        await query.edit_message_text(f"❌ 참가 거절 완료\n\n신청번호 : #{application_id}\n사유 : {REJECT_REASONS.get(reason_key,'')}"); return
 
-        try:
-            await context.bot.send_message(
-                chat_id=application["user_id"],
-                text=member_text,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            logger.exception(
-                "회원 결과 알림 실패 user_id=%s",
-                application["user_id"],
-            )
 
-        await query.edit_message_text(
-            f"{result}\n\n"
-            f"신청번호 : #{application_id}\n"
-            f"회원 ID : {application['user_id']}\n"
-            f"처리시간 : {now_kst()}"
-        )
+async def finish_reject(context: ContextTypes.DEFAULT_TYPE, application_id: int, reason: str, admin_id: int) -> None:
+    approw = get_application(application_id)
+    if not approw or approw["status"] in {"approved", "rejected"}:
         return
+    event = get_event(approw["event_id"])
+    set_application_status(application_id, "rejected", admin_id, reason)
+    base = event["rejection_html"] if event and event["rejection_html"] else "❌ 참가신청이 거절되었습니다."
+    try:
+        await context.bot.send_message(approw["user_id"], f"{base}\n\n<b>사유</b>\n{html.escape(reason)}", parse_mode=ParseMode.HTML)
+    except Exception:
+        logger.exception("회원 거절 알림 실패")
 
 
-async def callback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-
     try:
         await callback_handler_impl(update, context)
-
     except Exception as exc:
-        logger.exception(
-            "버튼 처리 오류 callback_data=%s",
-            query.data if query else None,
-        )
-
+        logger.exception("버튼 처리 오류 callback_data=%s", query.data if query else None)
         if query:
             try:
-                await query.answer(
-                    "버튼 처리 중 오류가 발생했습니다.",
-                    show_alert=True,
-                )
+                await query.answer("버튼 처리 중 오류가 발생했습니다.", show_alert=True)
             except Exception:
                 pass
-
             try:
-                await query.message.reply_text(
-                    "⚠️ 버튼 처리 중 오류가 발생했습니다.\n\n"
-                    f"오류 종류: <code>{html.escape(type(exc).__name__)}</code>\n"
-                    "Railway 로그에서 자세한 내용을 확인해주세요.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=(
-                        admin_home_keyboard()
-                        if is_admin(query.from_user.id)
-                        else None
-                    ),
-                )
+                await query.message.reply_text(f"⚠️ 버튼 처리 중 오류가 발생했습니다.\n\n오류 종류: <code>{html.escape(type(exc).__name__)}</code>\nRailway 로그에서 자세한 내용을 확인해주세요.", parse_mode=ParseMode.HTML, reply_markup=admin_home_keyboard() if is_admin(query.from_user.id) else None)
             except Exception:
                 pass
 
 
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
+    if not is_admin(user.id):
+        return
 
-    if is_admin(user.id):
-        if context.user_data.get("edit_status_button_emoji"):
-            value = (message.text or "").strip()
+    if context.user_data.get("edit_status_button_emoji"):
+        value = (message.text or "").strip()
+        if value == "없음":
+            set_setting("status_button_emoji", ""); set_setting("status_button_emoji_id", "")
+        else:
+            rich = message_to_html(message)
+            set_setting("status_button_emoji", button_emoji_from_html(rich))
+            set_setting("status_button_emoji_id", extract_custom_emoji_id_from_message(message))
+        context.user_data.clear(); await message.reply_text("✅ 내 신청상태 버튼 이모지를 저장했습니다.", reply_markup=admin_home_keyboard()); return
 
-            if value == "없음":
-                emoji_value = ""
-                custom_emoji_id = ""
+    if context.user_data.get("edit_group_text"):
+        which = context.user_data["edit_group_text"]
+        value = (message.text or "").strip()
+        set_setting("group_start_text" if which == "start" else "group_end_text", "" if value == "기본" else value)
+        context.user_data.clear(); await message.reply_text("✅ 그룹 공지 문구를 저장했습니다.", reply_markup=group_settings_keyboard()); return
+
+    event_id = context.user_data.get("schedule_event_id")
+    if event_id:
+        which = context.user_data.get("schedule_which")
+        value = (message.text or "").strip()
+        if value == "없음" and which == "start":
+            set_event_field(event_id, "start_at", "")
+            set_event_field(event_id, "status", "draft")
+        else:
+            dt = parse_kst(value)
+            if not dt:
+                await message.reply_text("형식이 올바르지 않습니다.\n예: 2026-08-07 18:00"); return
+            if which == "start":
+                end = parse_kst(get_event(event_id)["deadline_at"])
+                if end and dt >= end:
+                    await message.reply_text("시작시간은 마감시간보다 앞이어야 합니다."); return
+                set_event_field(event_id, "start_at", dt.strftime("%Y-%m-%d %H:%M")); set_event_field(event_id, "status", "scheduled" if dt > now_dt() else "active"); set_event_field(event_id, "start_announced", 0)
             else:
-                rich_value = message_to_html(message)
-                custom_emoji_id = extract_custom_emoji_id_from_message(
-                    message
-                )
-                emoji_value = button_emoji_from_html(rich_value)
+                start = parse_kst(get_event(event_id)["start_at"])
+                if start and dt <= start:
+                    await message.reply_text("마감시간은 시작시간보다 뒤여야 합니다."); return
+                set_event_field(event_id, "deadline_at", dt.strftime("%Y-%m-%d %H:%M")); set_event_field(event_id, "end_announced", 0)
+        context.user_data.clear(); await message.reply_text("✅ 시간을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id))); return
 
-                if not custom_emoji_id and not emoji_value:
-                    await message.reply_text(
-                        "일반 이모지 또는 프리미엄 이모지를 보내주세요."
-                    )
-                    return
+    emoji_event_id = context.user_data.get("edit_emoji_event_id")
+    emoji_field = context.user_data.get("edit_emoji_field")
+    if emoji_event_id and emoji_field:
+        value = (message.text or "").strip()
+        if value == "없음":
+            update_event_emoji(emoji_event_id, emoji_field, "", "")
+        else:
+            update_event_emoji(emoji_event_id, emoji_field, message_to_html(message), extract_custom_emoji_id_from_message(message))
+        context.user_data.clear(); await message.reply_text("✅ 이모지 설정을 저장했습니다.", reply_markup=emoji_manage_keyboard(emoji_event_id)); return
 
-            set_v8_setting(
-                "status_button_emoji",
-                emoji_value,
-            )
-            set_v8_setting(
-                "status_button_emoji_id",
-                custom_emoji_id,
-            )
-            context.user_data.clear()
+    edit_event_id = context.user_data.get("edit_event_id")
+    field = context.user_data.get("edit_event_field")
+    if edit_event_id and field:
+        html_value = message_to_html(message); plain_value = message.text or plain_from_html(html_value)
+        if not plain_value.strip():
+            await message.reply_text("빈 내용은 저장할 수 없습니다."); return
+        update_event_text(edit_event_id, field, plain_value, html_value)
+        context.user_data.clear(); await message.reply_text("✅ 수정 내용을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(edit_event_id))); return
 
-            await message.reply_text(
-                "내 신청 상태 버튼 이모지를 저장했습니다.",
-                reply_markup=admin_home_keyboard(),
-            )
-            return
-
-        deadline_event_id = context.user_data.get(
-            "edit_deadline_event_id"
-        )
-
-        if deadline_event_id:
-            value = (message.text or "").strip()
-
-            if value == "없음":
-                update_event_deadline(deadline_event_id, "")
-            else:
-                deadline = parse_deadline(value)
-                if not deadline:
-                    await message.reply_text(
-                        "형식이 올바르지 않습니다.\n"
-                        "예: 2026-07-31 23:30"
-                    )
-                    return
-
-                update_event_deadline(
-                    deadline_event_id,
-                    deadline.strftime("%Y-%m-%d %H:%M"),
-                )
-
-            context.user_data.clear()
-            event = get_event(deadline_event_id)
-
-            await message.reply_text(
-                "참여 마감시간을 저장했습니다.",
-                reply_markup=event_manage_keyboard(event),
-            )
-            return
-
-        emoji_event_id = context.user_data.get(
-            "edit_emoji_event_id"
-        )
-        emoji_field = context.user_data.get(
-            "edit_emoji_field"
-        )
-
-        if emoji_event_id and emoji_field:
-            value = (message.text or "").strip()
-
-            if value == "없음":
-                html_value = ""
-                custom_emoji_id = ""
-            else:
-                html_value = message_to_html(message)
-                custom_emoji_id = extract_custom_emoji_id_from_message(
-                    message
-                )
-
-            update_event_emoji(
-                emoji_event_id,
-                emoji_field,
-                html_value,
-                custom_emoji_id=custom_emoji_id,
-            )
-
-            context.user_data.clear()
-
-            await message.reply_text(
-                "이모지 설정을 저장했습니다.",
-                reply_markup=emoji_manage_keyboard(emoji_event_id),
-            )
-            return
-
-        event_id = context.user_data.get("edit_event_id")
-        field = context.user_data.get("edit_event_field")
-
-        if event_id and field:
-            html_value = message_to_html(message)
-            plain_value = message.text or plain_from_html(html_value)
-
-            if not plain_value.strip():
-                await message.reply_text(
-                    "빈 내용은 저장할 수 없습니다."
-                )
-                return
-
-            update_event_text(
-                event_id,
-                field,
-                plain_value,
-                html_value,
-            )
-
-            context.user_data.clear()
-            event = get_event(event_id)
-
-            await message.reply_text(
-                "✅ 수정 내용을 저장했습니다.",
-                reply_markup=event_manage_keyboard(event),
-            )
-            return
-
-    events = get_active_events()
-
-    if events:
-        await message.reply_text(
-            active_events_card(events),
-            parse_mode=ParseMode.HTML,
-            reply_markup=member_event_list_keyboard(events),
-        )
-    else:
-        await message.reply_text(
-            no_event_card(),
-            parse_mode=ParseMode.HTML,
-            reply_markup=member_no_event_keyboard(),
-        )
+    reject_id = context.user_data.get("reject_custom_id")
+    if reject_id:
+        reason = (message.text or "").strip()
+        if not reason:
+            await message.reply_text("거절 사유를 입력해주세요."); return
+        await finish_reject(context, reject_id, reason, user.id)
+        context.user_data.clear(); await message.reply_text(f"❌ 참가 거절 완료\n\n신청번호 : #{reject_id}\n사유 : {reason}", reply_markup=admin_home_keyboard()); return
 
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    logger.exception(
-        "업데이트 처리 중 오류",
-        exc_info=context.error,
-    )
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("업데이트 처리 중 오류", exc_info=context.error)
 
 
 def main() -> None:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN 환경변수가 없습니다.")
-
     if ADMIN_ID == 0:
         raise ValueError("ADMIN_ID 환경변수가 없습니다.")
 
     init_db()
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("setgroup", setgroup_command))
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("status", status_command))
-
-    app.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & filters.PHOTO,
-            photo_handler,
-        )
-    )
-    app.add_handler(
-        CallbackQueryHandler(callback_handler)
-    )
-    app.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE
-            & filters.TEXT
-            & ~filters.COMMAND,
-            text_handler,
-        )
-    )
-
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.ANIMATION, animation_handler))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info(
-        "신사 이벤트 참여봇 V8.2 PREMIUM BUTTON 실행 | ADMIN_ID=%s | DB=%s",
-        ADMIN_ID,
-        DB_FILE,
-    )
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    logger.info("신사 이벤트 참여봇 V9.3 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
