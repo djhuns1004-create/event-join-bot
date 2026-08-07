@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V15 FINAL CONTROL
+# 신사 이벤트 참여봇 V16 OPERATIONS PRO
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -54,12 +54,13 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v15_final_control")
+logger = logging.getLogger("sinsa_event_bot_v16_operations_pro")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
     "pending": "⏳ 관리자 승인 대기",
     "approved": "✅ 참가 승인",
+    "paid": "지급 완료",
     "rejected": "❌ 참가 거절",
     "notify_failed": "⚠️ 관리자 전달 실패",
     "cancelled": "🚫 신청 취소",
@@ -160,6 +161,12 @@ def init_db() -> None:
                 start_notice_message_type TEXT NOT NULL DEFAULT '',
                 end_notice_message_type TEXT NOT NULL DEFAULT '',
                 manual_mode INTEGER NOT NULL DEFAULT 0,
+                duplicate_policy TEXT NOT NULL DEFAULT 'retry_rejected',
+                max_participants INTEGER NOT NULL DEFAULT 0,
+                auto_delete_minutes INTEGER NOT NULL DEFAULT 0,
+                start_notice_delete_at TEXT NOT NULL DEFAULT '',
+                end_notice_delete_at TEXT NOT NULL DEFAULT '',
+                copied_from INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'draft',
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT '',
@@ -218,6 +225,12 @@ def init_db() -> None:
             ("start_notice_message_type", "TEXT NOT NULL DEFAULT ''"),
             ("end_notice_message_type", "TEXT NOT NULL DEFAULT ''"),
             ("manual_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("duplicate_policy", "TEXT NOT NULL DEFAULT 'retry_rejected'"),
+            ("max_participants", "INTEGER NOT NULL DEFAULT 0"),
+            ("auto_delete_minutes", "INTEGER NOT NULL DEFAULT 0"),
+            ("start_notice_delete_at", "TEXT NOT NULL DEFAULT ''"),
+            ("end_notice_delete_at", "TEXT NOT NULL DEFAULT ''"),
+            ("copied_from", "INTEGER NOT NULL DEFAULT 0"),
             ("status", "TEXT NOT NULL DEFAULT 'draft'"),
             ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ("updated_at", "TEXT NOT NULL DEFAULT ''"),
@@ -285,6 +298,9 @@ def init_db() -> None:
             ("admin_notified", "INTEGER NOT NULL DEFAULT 0"),
             ("proof_type", "TEXT NOT NULL DEFAULT ''"),
             ("reject_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("admin_note", "TEXT NOT NULL DEFAULT ''"),
+            ("paid_at", "TEXT"),
+            ("paid_by", "INTEGER"),
         ):
             ensure_column(conn, "applications_v6", column, definition)
 
@@ -583,6 +599,117 @@ def get_active_events() -> list[sqlite3.Row]:
     return [row for row in rows if event_time_window_open(row)]
 
 
+def event_application_counts(event_id: int) -> dict[str, int]:
+    counts = {k: 0 for k in STATUS_TEXT}
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT status,COUNT(*) count FROM applications_v6 WHERE event_id=? GROUP BY status",
+            (event_id,),
+        ).fetchall()
+    for row in rows:
+        counts[row["status"]] = row["count"]
+    return counts
+
+
+def event_submitted_count(event_id: int) -> int:
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) count FROM applications_v6
+            WHERE event_id=? AND status IN ('pending','approved','paid')
+            """,
+            (event_id,),
+        ).fetchone()
+    return int(row["count"] or 0)
+
+
+def event_capacity_reached(event: sqlite3.Row) -> bool:
+    limit = int(event["max_participants"] or 0)
+    return bool(limit > 0 and event_submitted_count(event["id"]) >= limit)
+
+
+def duplicate_allowed(event: sqlite3.Row, user_id: int) -> tuple[bool, Optional[sqlite3.Row]]:
+    existing = get_user_event_application(event["id"], user_id)
+    if not existing:
+        return True, None
+    policy = (event["duplicate_policy"] or "retry_rejected").strip()
+    if policy == "once":
+        return False, existing
+    if existing["status"] in {"rejected", "cancelled", "notify_failed"}:
+        return True, existing
+    return False, existing
+
+
+def copy_event(source_event_id: int) -> int:
+    source = get_event(source_event_id)
+    if not source:
+        raise ValueError("복사할 이벤트를 찾을 수 없습니다.")
+    now = now_kst()
+    copy_cols = [
+        "title","title_html","content","content_html","participation_time","participation_time_html",
+        "conditions","conditions_html","approval_text","approval_html","rejection_text","rejection_html",
+        "emoji_title","emoji_title_id","emoji_content","emoji_time","emoji_start","emoji_deadline",
+        "emoji_conditions","emoji_proof","emoji_approval","emoji_rejection",
+        "start_notice_text","start_notice_html","end_notice_text","end_notice_html",
+        "duplicate_policy","max_participants","auto_delete_minutes"
+    ]
+    with db_connect() as conn:
+        values = [source[c] for c in copy_cols]
+        cols_sql = ",".join(copy_cols)
+        qs = ",".join("?" for _ in copy_cols)
+        cur = conn.execute(
+            f"INSERT INTO events({cols_sql},status,created_at,updated_at,start_at,deadline_at,manual_mode,start_announced,end_announced,copied_from) "
+            f"VALUES({qs},'draft',?,?,?,?,0,0,0,?)",
+            (*values, now, now, "", "", source_event_id),
+        )
+        new_id = cur.lastrowid
+        media = conn.execute(
+            "SELECT file_id,media_type FROM event_media_v11 WHERE event_id=? ORDER BY id LIMIT 5",
+            (source_event_id,),
+        ).fetchall()
+        for m in media:
+            conn.execute(
+                "INSERT INTO event_media_v11(event_id,file_id,media_type,created_at) VALUES(?,?,?,?)",
+                (new_id,m["file_id"],m["media_type"],now),
+            )
+        conn.commit()
+    return new_id
+
+
+def set_application_note(application_id: int, note: str) -> None:
+    with db_connect() as conn:
+        conn.execute("UPDATE applications_v6 SET admin_note=? WHERE id=?", (note, application_id))
+        conn.commit()
+
+
+def mark_application_paid(application_id: int, admin_id: int) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE applications_v6 SET status='paid',paid_at=?,paid_by=?,processed_at=COALESCE(processed_at,?) WHERE id=?",
+            (now_kst(), admin_id, now_kst(), application_id),
+        )
+        conn.commit()
+
+
+def search_applications(term: str, event_id: Optional[int] = None) -> list[sqlite3.Row]:
+    term = term.strip()
+    like = f"%{term}%"
+    params = []
+    where = ""
+    if event_id:
+        where += " AND event_id=?"
+        params.append(event_id)
+    with db_connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM applications_v6
+            WHERE (name LIKE ? OR username LIKE ? OR CAST(user_id AS TEXT) LIKE ?){where}
+            ORDER BY id DESC LIMIT 30
+            """,
+            (like, like, like, *params),
+        ).fetchall()
+    return rows
+
 def create_event() -> int:
     now = now_kst()
     with db_connect() as conn:
@@ -651,7 +778,8 @@ def set_event_field(event_id: int, field: str, value) -> None:
         "end_media_file_id", "end_media_type",
         "pre_notice_message_id", "start_notice_message_id", "end_notice_message_id",
         "pre_notice_message_type", "start_notice_message_type", "end_notice_message_type",
-        "manual_mode"
+        "manual_mode", "duplicate_policy", "max_participants", "auto_delete_minutes",
+        "start_notice_delete_at", "end_notice_delete_at", "copied_from"
     }
     if field not in allowed:
         raise ValueError("잘못된 이벤트 설정입니다.")
@@ -842,22 +970,21 @@ def event_card(event: sqlite3.Row, admin: bool = False) -> str:
         f"{event_conditions_html(event)}\n"
         f"{CARD_LINE}"
     )
-
     if admin:
-        status = {
-            "draft": "등록 대기",
-            "scheduled": "예약",
-            "active": "진행중",
-            "ended": "종료",
-        }.get(event["status"], event["status"])
+        status = {"draft":"등록 대기","scheduled":"예약","active":"진행중","ended":"종료"}.get(event["status"], event["status"])
         mode = int(event["manual_mode"] or 0)
-        mode_text = {0: "예약 자동", 1: "수동 ON", 2: "수동 OFF"}.get(mode, "예약 자동")
+        mode_text = {0:"예약 자동",1:"수동 ON",2:"수동 OFF"}.get(mode,"예약 자동")
+        counts = event_application_counts(event["id"])
+        dup = "1인 1회" if event["duplicate_policy"] == "once" else "거절 후 재신청"
+        limit = int(event["max_participants"] or 0)
+        delete_min = int(event["auto_delete_minutes"] or 0)
         text += (
-            f"\n상태 : {status}"
-            f"\n운영 : {mode_text}"
-            f"\n대표 이미지/GIF : {event_media_count(event['id'])}/5개"
+            f"\n상태 : {status} / {mode_text}"
+            f"\n신청 : {counts.get('pending',0)} 대기 · {counts.get('approved',0)} 승인 · {counts.get('paid',0)} 지급 · {counts.get('rejected',0)} 거절"
+            f"\n중복 : {dup}"
+            f"\n정원 : {'무제한' if limit <= 0 else str(limit)+'명'}"
+            f"\n공지삭제 : {'사용안함' if delete_min <= 0 else str(delete_min)+'분 후'}"
         )
-
     return text
 
 
@@ -929,20 +1056,32 @@ def submission_keyboard(application_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def admin_application_keyboard(application_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("참가 승인", callback_data=f"application:approve:{application_id}"),
-        InlineKeyboardButton("참가 거절", callback_data=f"application:reject:{application_id}"),
-    ]])
+def admin_application_keyboard(application_id: int, status: str = "pending") -> InlineKeyboardMarkup:
+    rows = []
+    if status in {"collecting", "pending", "notify_failed"}:
+        rows.append([
+            InlineKeyboardButton("참가 승인", callback_data=f"application:approve:{application_id}"),
+            InlineKeyboardButton("참가 거절", callback_data=f"application:reject:{application_id}"),
+        ])
+    if status == "approved":
+        rows.append([InlineKeyboardButton("지급 완료", callback_data=f"application:paid:{application_id}")])
+    rows.append([InlineKeyboardButton("관리자 메모", callback_data=f"application:note:{application_id}")])
+    app = get_application(application_id)
+    if app:
+        rows.append([InlineKeyboardButton("뒤로가기", callback_data=f"back:event:{app['event_id']}")])
+    else:
+        rows.append([InlineKeyboardButton("관리자 메뉴", callback_data="back:admin")])
+    return InlineKeyboardMarkup(rows)
 
 
 def reject_reason_keyboard(application_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📸 인증사진 확인 불가", callback_data=f"reject:photo:{application_id}")],
-        [InlineKeyboardButton("📅 당일 기록 확인 불가", callback_data=f"reject:date:{application_id}")],
-        [InlineKeyboardButton("❗ 참여조건 미달", callback_data=f"reject:condition:{application_id}")],
-        [InlineKeyboardButton("🔁 중복 신청", callback_data=f"reject:duplicate:{application_id}")],
-        [InlineKeyboardButton("✏ 직접 사유 입력", callback_data=f"reject:custom:{application_id}")],
+        [InlineKeyboardButton("인증사진 확인 불가", callback_data=f"reject:photo:{application_id}")],
+        [InlineKeyboardButton("당일 기록 확인 불가", callback_data=f"reject:date:{application_id}")],
+        [InlineKeyboardButton("참여조건 미달", callback_data=f"reject:condition:{application_id}")],
+        [InlineKeyboardButton("중복 신청", callback_data=f"reject:duplicate:{application_id}")],
+        [InlineKeyboardButton("직접 사유 입력", callback_data=f"reject:custom:{application_id}")],
+        [InlineKeyboardButton("뒤로가기", callback_data=f"appview:{application_id}")],
     ])
 
 
@@ -954,6 +1093,7 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("전체 승인 대기", callback_data="admin:pending"),
             InlineKeyboardButton("전체 신청 현황", callback_data="admin:stats")
         ],
+        [InlineKeyboardButton("신청자 검색", callback_data="admin:search")],
         [InlineKeyboardButton("이모지 설정", callback_data="admin:emoji")],
         [InlineKeyboardButton("관리자 메뉴 닫기", callback_data="admin:close")],
     ])
@@ -1013,81 +1153,67 @@ def admin_event_list_keyboard() -> InlineKeyboardMarkup:
 
 
 def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
-    mode = int(event["manual_mode"] or 0)
-    is_on = event["status"] == "active" and mode != 2
-
+    is_on = event["status"] == "active" and int(event["manual_mode"] or 0) != 2
     rows = [
-        [
-            InlineKeyboardButton(
-                "ON",
-                callback_data=f"event_toggle:on:{event['id']}",
-            ),
-            InlineKeyboardButton(
-                "OFF",
-                callback_data=f"event_toggle:off:{event['id']}",
-            ),
-        ],
-        [
-            InlineKeyboardButton("이벤트명", callback_data=f"edit:title:{event['id']}"),
-            InlineKeyboardButton("이벤트 내용", callback_data=f"edit:content:{event['id']}")
-        ],
-        [
-            InlineKeyboardButton("시작시간", callback_data=f"schedule:start:{event['id']}"),
-            InlineKeyboardButton("마감시간", callback_data=f"schedule:end:{event['id']}")
-        ],
-        [InlineKeyboardButton("이벤트 조건", callback_data=f"edit:conditions:{event['id']}")],
-        [InlineKeyboardButton("대표 이미지/GIF", callback_data=f"media:set:{event['id']}")],
-        [
-            InlineKeyboardButton("승인 문구", callback_data=f"edit:approval:{event['id']}"),
-            InlineKeyboardButton("거절 문구", callback_data=f"edit:rejection:{event['id']}")
-        ],
-        [
-            InlineKeyboardButton("시작공지 문구", callback_data=f"edit:start_notice:{event['id']}"),
-            InlineKeyboardButton("종료공지 문구", callback_data=f"edit:end_notice:{event['id']}")
-        ],
-        [InlineKeyboardButton("이모지 설정", callback_data=f"emoji:menu:{event['id']}")],
+        [InlineKeyboardButton("ON", callback_data=f"event_toggle:on:{event['id']}"), InlineKeyboardButton("OFF", callback_data=f"event_toggle:off:{event['id']}")],
+        [InlineKeyboardButton("이벤트명", callback_data=f"edit:title:{event['id']}"), InlineKeyboardButton("이벤트 내용", callback_data=f"edit:content:{event['id']}")],
+        [InlineKeyboardButton("시작시간", callback_data=f"schedule:start:{event['id']}"), InlineKeyboardButton("마감시간", callback_data=f"schedule:end:{event['id']}")],
+        [InlineKeyboardButton("이벤트 조건", callback_data=f"edit:conditions:{event['id']}"), InlineKeyboardButton("대표 이미지/GIF", callback_data=f"media:set:{event['id']}")],
+        [InlineKeyboardButton("승인 문구", callback_data=f"edit:approval:{event['id']}"), InlineKeyboardButton("거절 문구", callback_data=f"edit:rejection:{event['id']}")],
+        [InlineKeyboardButton("시작공지", callback_data=f"edit:start_notice:{event['id']}"), InlineKeyboardButton("종료공지", callback_data=f"edit:end_notice:{event['id']}")],
+        [InlineKeyboardButton("중복 신청", callback_data=f"ops:duplicate:{event['id']}"), InlineKeyboardButton("마감 인원", callback_data=f"ops:capacity:{event['id']}")],
+        [InlineKeyboardButton("공지 자동삭제", callback_data=f"ops:autodelete:{event['id']}"), InlineKeyboardButton("이벤트 복사", callback_data=f"ops:copy:{event['id']}")],
+        [InlineKeyboardButton("신청자 검색", callback_data=f"ops:search:{event['id']}"), InlineKeyboardButton("신청 현황", callback_data=f"event:stats:{event['id']}")],
+        [InlineKeyboardButton("승인 대기", callback_data=f"event:pending:{event['id']}"), InlineKeyboardButton("이모지 설정", callback_data=f"emoji:menu:{event['id']}")],
         [InlineKeyboardButton("미리보기", callback_data=f"event:preview:{event['id']}")],
-        [
-            InlineKeyboardButton("승인 대기", callback_data=f"event:pending:{event['id']}"),
-            InlineKeyboardButton("신청 현황", callback_data=f"event:stats:{event['id']}")
-        ],
     ]
-
     if not is_on:
         rows.append([InlineKeyboardButton("이벤트 삭제", callback_data=f"event:delete_confirm:{event['id']}")])
-
-    rows.append([InlineKeyboardButton("전체 이벤트", callback_data="admin:event_list")])
-    rows.append([InlineKeyboardButton("관리자 메뉴", callback_data="admin:home")])
+    rows.append([InlineKeyboardButton("뒤로가기", callback_data="back:event_list")])
+    rows.append([InlineKeyboardButton("관리자 메뉴", callback_data="back:admin")])
     return InlineKeyboardMarkup(rows)
 
 
 def emoji_manage_keyboard(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("이벤트명", callback_data=f"emoji_edit:emoji_title:{event_id}"),
-            InlineKeyboardButton("이벤트 내용", callback_data=f"emoji_edit:emoji_content:{event_id}")
-        ],
-        [
-            InlineKeyboardButton("진행기간", callback_data=f"emoji_edit:emoji_time:{event_id}"),
-            InlineKeyboardButton("이벤트 조건", callback_data=f"emoji_edit:emoji_conditions:{event_id}")
-        ],
-        [
-            InlineKeyboardButton("승인", callback_data=f"emoji_edit:emoji_approval:{event_id}"),
-            InlineKeyboardButton("거절", callback_data=f"emoji_edit:emoji_rejection:{event_id}")
-        ],
+        [InlineKeyboardButton("이벤트명", callback_data=f"emoji_edit:emoji_title:{event_id}"), InlineKeyboardButton("이벤트 내용", callback_data=f"emoji_edit:emoji_content:{event_id}")],
+        [InlineKeyboardButton("진행기간", callback_data=f"emoji_edit:emoji_time:{event_id}"), InlineKeyboardButton("이벤트 조건", callback_data=f"emoji_edit:emoji_conditions:{event_id}")],
+        [InlineKeyboardButton("승인", callback_data=f"emoji_edit:emoji_approval:{event_id}"), InlineKeyboardButton("거절", callback_data=f"emoji_edit:emoji_rejection:{event_id}")],
         [InlineKeyboardButton("모든 이모지 제거", callback_data=f"emoji:clear:{event_id}")],
-        [InlineKeyboardButton("이벤트 관리", callback_data=f"event:manage:{event_id}")],
+        [InlineKeyboardButton("뒤로가기", callback_data=f"back:event:{event_id}")],
+    ])
+
+
+def duplicate_policy_keyboard(event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1인 1회", callback_data=f"ops_duplicate:once:{event_id}")],
+        [InlineKeyboardButton("거절 후 재신청 허용", callback_data=f"ops_duplicate:retry_rejected:{event_id}")],
+        [InlineKeyboardButton("뒤로가기", callback_data=f"back:event:{event_id}")],
+    ])
+
+
+def auto_delete_keyboard(event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("사용 안 함", callback_data=f"ops_autodelete:0:{event_id}")],
+        [InlineKeyboardButton("5분", callback_data=f"ops_autodelete:5:{event_id}"), InlineKeyboardButton("10분", callback_data=f"ops_autodelete:10:{event_id}")],
+        [InlineKeyboardButton("30분", callback_data=f"ops_autodelete:30:{event_id}"), InlineKeyboardButton("60분", callback_data=f"ops_autodelete:60:{event_id}")],
+        [InlineKeyboardButton("뒤로가기", callback_data=f"back:event:{event_id}")],
     ])
 
 
 def group_settings_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("관리자 메뉴", callback_data="admin:home")]
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("뒤로가기", callback_data="back:admin")]])
 
 
 def simple_back(event_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("이벤트 관리", callback_data=f"event:manage:{event_id}")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("뒤로가기", callback_data=f"back:event:{event_id}")]])
+
+
+def application_back_keyboard(application_id: int, event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("신청 확인", callback_data=f"appview:{application_id}")],
+        [InlineKeyboardButton("뒤로가기", callback_data=f"back:event:{event_id}")],
+    ])
 
 
 def get_user_event_application(event_id: int, user_id: int) -> Optional[sqlite3.Row]:
@@ -1386,6 +1512,11 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
     except Exception:
         logger.exception("공지 고정 실패 kind=%s event_id=%s", kind, event_id)
 
+    delete_minutes = int(event["auto_delete_minutes"] or 0)
+    if delete_minutes > 0 and kind in {"start", "end"}:
+        delete_at = (now_dt() + timedelta(minutes=delete_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+        set_event_field(event_id, "start_notice_delete_at" if kind == "start" else "end_notice_delete_at", delete_at)
+
     if kind == "pre":
         set_event_field(event_id, "pre_notice_announced", 1)
         return True, "그룹 예고공지를 반영했습니다."
@@ -1397,6 +1528,28 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
     await disable_start_notice_button(application, get_event(event_id))
     return True, "그룹 마감공지를 반영했습니다."
 
+
+async def delete_due_notice_messages(application: Application) -> None:
+    group_id = get_setting("group_id", "").strip()
+    if not group_id:
+        return
+    now = now_dt()
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM events WHERE status!='deleted' AND (start_notice_delete_at!='' OR end_notice_delete_at!='')"
+        ).fetchall()
+    for event in rows:
+        for kind in ("start", "end"):
+            due = parse_kst(event[f"{kind}_notice_delete_at"])
+            mid = int(event[f"{kind}_notice_message_id"] or 0)
+            if due and now >= due:
+                if mid:
+                    try:
+                        await application.bot.delete_message(int(group_id), mid)
+                    except Exception:
+                        logger.warning("공지 자동삭제 실패 event_id=%s kind=%s", event["id"], kind)
+                set_event_field(event["id"], f"{kind}_notice_message_id", 0)
+                set_event_field(event["id"], f"{kind}_notice_delete_at", "")
 
 async def scheduler_loop(application: Application):
     await asyncio.sleep(2)
@@ -1482,6 +1635,11 @@ async def scheduler_loop(application: Application):
             raise
         except Exception:
             logger.exception("자동 이벤트 스케줄러 전체 오류")
+
+        try:
+            await delete_due_notice_messages(application)
+        except Exception:
+            logger.exception("공지 자동삭제 확인 오류")
 
         await asyncio.sleep(5)
 
@@ -1675,7 +1833,7 @@ async def send_application_to_admin(context: ContextTypes.DEFAULT_TYPE, applicat
         chat_id=ADMIN_ID,
         text="<b>신청 확인</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=admin_application_keyboard(application["id"]),
+        reply_markup=admin_application_keyboard(application["id"], "pending"),
     )
 
 
@@ -1685,36 +1843,77 @@ async def send_pending(message, event_id: Optional[int] = None) -> None:
             rows = conn.execute("SELECT * FROM applications_v6 WHERE status='pending' ORDER BY id DESC LIMIT 50").fetchall()
         else:
             rows = conn.execute("SELECT * FROM applications_v6 WHERE status='pending' AND event_id=? ORDER BY id DESC LIMIT 50", (event_id,)).fetchall()
+    back = event_manage_keyboard(get_event(event_id)) if event_id and get_event(event_id) else admin_home_keyboard()
     if not rows:
-        await message.reply_text("📭 승인 대기 신청이 없습니다.", reply_markup=event_manage_keyboard(get_event(event_id)) if event_id else admin_home_keyboard())
+        await message.reply_text("승인 대기 신청이 없습니다.", reply_markup=back)
         return
     lines = ["<b>승인 대기 목록</b>\n"]
     for row in rows:
-        lines.append(f"📌 #{row['id']} / {html.escape(row['event_title'])}\n👤 {html.escape(row['name'] or '-')}\n🆔 <code>{row['user_id']}</code>\n📸 {application_photo_count(row['id'])}장\n──────────────")
-    await message.reply_text("\n".join(lines)[:4000], parse_mode=ParseMode.HTML, reply_markup=event_manage_keyboard(get_event(event_id)) if event_id else admin_home_keyboard())
+        lines.append(
+            f"{html.escape(row['event_title'])}\n"
+            f"회원 : {html.escape(row['name'] or '-')} / {html.escape(row['username'] or '-')}\n"
+            f"ID : <code>{row['user_id']}</code> · 사진 {application_photo_count(row['id'])}장\n"
+            f"메모 : {html.escape(row['admin_note'] or '-')}\n{CARD_LINE}"
+        )
+    await message.reply_text("\n".join(lines)[:4000], parse_mode=ParseMode.HTML, reply_markup=back)
 
 
 async def send_stats(message, event_id: Optional[int] = None) -> None:
-    with db_connect() as conn:
-        if event_id is None:
+    if event_id is None:
+        with db_connect() as conn:
             rows = conn.execute("SELECT status,COUNT(*) count FROM applications_v6 GROUP BY status").fetchall()
-        else:
+        event = None
+    else:
+        with db_connect() as conn:
             rows = conn.execute("SELECT status,COUNT(*) count FROM applications_v6 WHERE event_id=? GROUP BY status", (event_id,)).fetchall()
-    counts = {k: 0 for k in STATUS_TEXT}
-    for row in rows:
-        counts[row["status"]] = row["count"]
-    event = get_event(event_id) if event_id else None
+        event = get_event(event_id)
+    counts = {k:0 for k in STATUS_TEXT}
+    for row in rows: counts[row["status"]] = row["count"]
+    total = sum(counts.values())
+    title = event_title_html(event) if event else "전체 이벤트"
     await message.reply_text(
-        "<b>이벤트 신청 현황</b>\n\n"
-        f"🎉 {event_title_html(event) if event else '전체 이벤트'}\n\n"
-        f"📸 사진 등록 중 : {counts.get('collecting',0)}건\n"
-        f"⏳ 승인 대기 : {counts.get('pending',0)}건\n"
-        f"✅ 승인 : {counts.get('approved',0)}건\n"
-        f"❌ 거절 : {counts.get('rejected',0)}건\n"
-        f"⚠️ 전달 실패 : {counts.get('notify_failed',0)}건",
+        f"<b>신청 현황</b>\n\n<b>{title}</b>\n\n"
+        f"전체 : {total}명\n"
+        f"등록중 : {counts.get('collecting',0)}\n"
+        f"승인대기 : {counts.get('pending',0)}\n"
+        f"승인 : {counts.get('approved',0)}\n"
+        f"지급완료 : {counts.get('paid',0)}\n"
+        f"거절 : {counts.get('rejected',0)}\n"
+        f"전달실패 : {counts.get('notify_failed',0)}",
         parse_mode=ParseMode.HTML,
         reply_markup=event_manage_keyboard(event) if event else admin_home_keyboard(),
     )
+
+
+async def show_application_detail(query, application_id: int) -> None:
+    app = get_application(application_id)
+    if not app:
+        await query.answer("신청 내역을 찾을 수 없습니다.", show_alert=True)
+        return
+    text_value = (
+        "<b>신청 확인</b>\n\n"
+        f"이벤트 : {html.escape(app['event_title'])}\n"
+        f"회원 : {html.escape(app['name'] or '-')}\n"
+        f"아이디 : {html.escape(app['username'] or '-')}\n"
+        f"회원 ID : <code>{app['user_id']}</code>\n"
+        f"상태 : {html.escape(STATUS_TEXT.get(app['status'], app['status']))}\n"
+        f"인증 이미지 : {application_photo_count(application_id)}장\n"
+        f"관리자 메모 : {html.escape(app['admin_note'] or '-')}"
+    )
+    await safe_edit(query, text_value, admin_application_keyboard(application_id, app["status"]), ParseMode.HTML)
+
+
+async def safe_edit(query, text_value: str, reply_markup=None, parse_mode=None) -> None:
+    try:
+        await query.edit_message_text(text_value, parse_mode=parse_mode, reply_markup=reply_markup)
+    except BadRequest as exc:
+        if "Message is not modified" in str(exc):
+            try:
+                await query.edit_message_reply_markup(reply_markup=reply_markup)
+            except BadRequest:
+                pass
+            return
+        raise
 
 
 async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1752,8 +1951,11 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             if not event or not event_is_open(event):
                 await query.message.reply_text("현재 이벤트 참여 시간이 아닙니다.\n\n설정된 시작시간 이후부터 마감시간 전까지만 참여할 수 있습니다.", parse_mode=ParseMode.HTML)
                 return
-            existing = get_user_event_application(event_id, query.from_user.id)
-            if existing and existing["status"] in {"collecting", "pending", "approved"}:
+            if event_capacity_reached(event):
+                await query.answer("신청 인원이 마감되었습니다.", show_alert=True)
+                return
+            allowed, existing = duplicate_allowed(event, query.from_user.id)
+            if not allowed:
                 await query.message.reply_text(status_card(existing), parse_mode=ParseMode.HTML)
                 return
             application_id = create_application(event, query.from_user, "image")
@@ -1789,6 +1991,9 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
         if not photos:
             await query.answer("인증사진을 1장 이상 등록해주세요.", show_alert=True)
             return
+        if event_capacity_reached(event):
+            await query.answer("신청 인원이 마감되었습니다.", show_alert=True)
+            return
         try:
             await send_application_to_admin(context, approw, photos)
         except Exception:
@@ -1798,6 +2003,14 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             return
         set_application_status(application_id, "pending")
         context.user_data.pop("collecting_application_id", None)
+        event = get_event(approw["event_id"])
+        if event and event_capacity_reached(event):
+            set_event_field(event["id"], "manual_mode", 2)
+            end_event(event["id"])
+            try:
+                await send_group_notice(context.application, event["id"], "end", manual=True)
+            except Exception:
+                logger.exception("정원 마감 종료공지 실패")
         await query.edit_message_text(f"<b>참가 신청이 접수되었습니다.</b>\n\n인증사진 : {len(photos)}장\n\n관리자 확인 후 결과를 안내드립니다.", parse_mode=ParseMode.HTML)
         return
 
@@ -1827,6 +2040,11 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if data == "admin:stats":
         await send_stats(query.message)
+        return
+    if data == "admin:search":
+        context.user_data.clear()
+        context.user_data["search_applications"] = True
+        await safe_edit(query, "<b>신청자 검색</b>\n\n닉네임, @아이디 또는 숫자 ID를 입력해주세요.", InlineKeyboardMarkup([[InlineKeyboardButton("뒤로가기", callback_data="back:admin")]]), ParseMode.HTML)
         return
     if data == "admin:emoji":
         context.user_data.clear()
@@ -1901,6 +2119,56 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             show_alert=True,
         )
         return
+
+    if data.startswith("back:"):
+        parts = data.split(":")
+        context.user_data.clear()
+        if parts[1] == "admin":
+            await safe_edit(query, "<b>이벤트 관리자 메뉴</b>\n\n이벤트를 등록하거나 관리해주세요.", admin_home_keyboard(), ParseMode.HTML)
+            return
+        if parts[1] == "event_list":
+            await safe_edit(query, "<b>전체 이벤트 관리</b>\n\n관리할 이벤트를 선택해주세요.", admin_event_list_keyboard(), ParseMode.HTML)
+            return
+        if parts[1] == "event":
+            event_id = int(parts[2]); event = get_event(event_id)
+            if not event:
+                await safe_edit(query, "이벤트를 찾을 수 없습니다.", admin_home_keyboard())
+                return
+            await safe_edit(query, event_card(event, admin=True), event_manage_keyboard(event), ParseMode.HTML)
+            return
+
+    if data.startswith("appview:"):
+        await show_application_detail(query, int(data.split(":")[1]))
+        return
+
+    if data.startswith("ops:"):
+        _, action, event_id_text = data.split(":")
+        event_id = int(event_id_text); event = get_event(event_id)
+        if not event:
+            await query.answer("이벤트를 찾을 수 없습니다.", show_alert=True); return
+        if action == "duplicate":
+            await safe_edit(query, "<b>중복 신청 설정</b>\n\n신청 정책을 선택해주세요.", duplicate_policy_keyboard(event_id), ParseMode.HTML); return
+        if action == "capacity":
+            context.user_data.clear(); context.user_data["capacity_event_id"] = event_id
+            await safe_edit(query, "<b>마감 인원 설정</b>\n\n숫자를 입력해주세요.\n0 입력 시 무제한입니다.", simple_back(event_id), ParseMode.HTML); return
+        if action == "autodelete":
+            await safe_edit(query, "<b>공지 자동삭제</b>\n\n시작/종료 공지를 몇 분 후 삭제할지 선택해주세요.", auto_delete_keyboard(event_id), ParseMode.HTML); return
+        if action == "copy":
+            new_id = copy_event(event_id); copied = get_event(new_id)
+            await safe_edit(query, event_card(copied, admin=True)+"\n\n복사 완료. 시작/마감시간만 새로 설정해주세요.", event_manage_keyboard(copied), ParseMode.HTML); return
+        if action == "search":
+            context.user_data.clear(); context.user_data["search_applications"] = True; context.user_data["search_event_id"] = event_id
+            await safe_edit(query, "<b>신청자 검색</b>\n\n닉네임, @아이디 또는 숫자 ID를 입력해주세요.", simple_back(event_id), ParseMode.HTML); return
+
+    if data.startswith("ops_duplicate:"):
+        _, policy, event_id_text = data.split(":")
+        event_id = int(event_id_text); set_event_field(event_id, "duplicate_policy", policy)
+        await safe_edit(query, event_card(get_event(event_id), admin=True), event_manage_keyboard(get_event(event_id)), ParseMode.HTML); return
+
+    if data.startswith("ops_autodelete:"):
+        _, minutes, event_id_text = data.split(":")
+        event_id = int(event_id_text); set_event_field(event_id, "auto_delete_minutes", int(minutes))
+        await safe_edit(query, event_card(get_event(event_id), admin=True), event_manage_keyboard(get_event(event_id)), ParseMode.HTML); return
 
     if data.startswith("event_toggle:"):
         _, action, event_id_text = data.split(":")
@@ -2166,43 +2434,42 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
         application_id = int(aid); approw = get_application(application_id)
         if not approw:
             await query.answer("신청 내역을 찾을 수 없습니다.", show_alert=True); return
-        if approw["status"] in {"approved", "rejected"}:
+
+        if action == "note":
+            context.user_data.clear(); context.user_data["application_note_id"] = application_id
+            await safe_edit(query, "<b>관리자 메모</b>\n\n내부 메모를 입력해주세요.\n삭제하려면 <code>없음</code> 입력.", application_back_keyboard(application_id, approw["event_id"]), ParseMode.HTML)
+            return
+
+        if action == "paid":
+            if approw["status"] != "approved":
+                await query.answer("승인 완료 상태에서만 지급완료 처리할 수 있습니다.", show_alert=True); return
+            mark_application_paid(application_id, query.from_user.id)
+            try:
+                await context.bot.send_message(approw["user_id"], "<b>이벤트 지급이 완료되었습니다.</b>", parse_mode=ParseMode.HTML)
+            except Exception:
+                logger.exception("회원 지급완료 알림 실패")
+            await show_application_detail(query, application_id)
+            return
+
+        if approw["status"] in {"approved", "paid", "rejected"}:
             await query.answer("이미 처리된 신청입니다.", show_alert=True); return
+
         if action == "approve":
             event = get_event(approw["event_id"])
             if not event:
-                await query.answer("이벤트를 찾을 수 없습니다.", show_alert=True)
-                return
-
+                await query.answer("이벤트를 찾을 수 없습니다.", show_alert=True); return
             set_application_status(application_id, "approved", query.from_user.id)
-
-            approval_body = (
-                event["approval_html"]
-                or "<b>이벤트 승인이 완료되었습니다.</b>"
-            )
+            approval_body = event["approval_html"] or "<b>이벤트 승인이 완료되었습니다.</b>"
             approval_prefix = field_prefix(event, "emoji_approval")
             member_text = f"{approval_prefix}{approval_body}" if approval_prefix else approval_body
-
             try:
-                await context.bot.send_message(
-                    approw["user_id"],
-                    member_text,
-                    parse_mode=ParseMode.HTML,
-                )
+                await context.bot.send_message(approw["user_id"], member_text, parse_mode=ParseMode.HTML)
             except Exception:
                 logger.exception("회원 승인 알림 실패")
-
-            await query.edit_message_text(
-                f"참가 승인 완료\n\n"
-                f"회원 ID : {approw['user_id']}\n"
-                f"처리시간 : {now_kst()}"
-            )
+            await show_application_detail(query, application_id)
             return
 
-        await query.edit_message_text(
-            "거절 사유를 선택해주세요.",
-            reply_markup=reject_reason_keyboard(application_id),
-        )
+        await safe_edit(query, "거절 사유를 선택해주세요.", reject_reason_keyboard(application_id))
         return
 
     if data.startswith("reject:"):
@@ -2247,6 +2514,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     try:
         await callback_handler_impl(update, context)
+    except BadRequest as exc:
+        if "Message is not modified" in str(exc):
+            return
+        logger.exception("버튼 처리 BadRequest callback_data=%s", query.data if query else None)
+        try:
+            await query.answer("버튼을 다시 눌러주세요.", show_alert=True)
+        except Exception:
+            pass
     except Exception as exc:
         logger.exception("버튼 처리 오류 callback_data=%s", query.data if query else None)
         if query:
@@ -2265,6 +2540,37 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user = update.effective_user
     if not is_admin(user.id):
         return
+
+    if context.user_data.get("search_applications"):
+        term = (message.text or "").strip()
+        if not term:
+            await message.reply_text("검색어를 입력해주세요."); return
+        event_id = context.user_data.get("search_event_id")
+        rows = search_applications(term, event_id)
+        context.user_data.clear()
+        if not rows:
+            await message.reply_text("검색 결과가 없습니다.", reply_markup=event_manage_keyboard(get_event(event_id)) if event_id else admin_home_keyboard()); return
+        kb=[]
+        for row in rows[:20]:
+            label=f"{row['name'] or '-'} / {row['username'] or row['user_id']} / {STATUS_TEXT.get(row['status'],row['status'])}"
+            kb.append([InlineKeyboardButton(label[:55], callback_data=f"appview:{row['id']}")])
+        kb.append([InlineKeyboardButton("뒤로가기", callback_data=f"back:event:{event_id}" if event_id else "back:admin")])
+        await message.reply_text("<b>신청자 검색 결과</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb)); return
+
+    if context.user_data.get("capacity_event_id"):
+        event_id = int(context.user_data["capacity_event_id"])
+        value=(message.text or "").strip()
+        if not value.isdigit():
+            await message.reply_text("0 이상의 숫자로 입력해주세요."); return
+        set_event_field(event_id, "max_participants", int(value))
+        context.user_data.clear()
+        await message.reply_text("마감 인원을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id))); return
+
+    if context.user_data.get("application_note_id"):
+        aid=int(context.user_data["application_note_id"]); value=(message.text or "").strip()
+        set_application_note(aid, "" if value == "없음" else value)
+        app=get_application(aid); context.user_data.clear()
+        await message.reply_text("관리자 메모를 저장했습니다.", reply_markup=application_back_keyboard(aid, app["event_id"] if app else 0)); return
 
     if context.user_data.get("edit_no_event_emoji"):
         value = (message.text or "").strip()
@@ -2361,7 +2667,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not reason:
             await message.reply_text("거절 사유를 입력해주세요."); return
         await finish_reject(context, reject_id, reason, user.id)
-        context.user_data.clear(); await message.reply_text(f"❌ 참가 거절 완료\n\n신청번호 : #{reject_id}\n사유 : {reason}", reply_markup=admin_home_keyboard()); return
+        context.user_data.clear(); await message.reply_text(f"참가 거절 완료\n\n사유 : {reason}", reply_markup=application_back_keyboard(reject_id, get_application(reject_id)["event_id"] if get_application(reject_id) else 0)); return
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2387,7 +2693,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V15 FINAL CONTROL 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V16 OPERATIONS PRO 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
