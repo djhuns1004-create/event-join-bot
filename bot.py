@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V12.2 APPROVAL FLOW
+# 신사 이벤트 참여봇 V12.3 COMPACT UI
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -48,13 +48,13 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
 DB_FILE = os.getenv("DB_FILE", os.getenv("DB_PATH", "/data/event_bot.db")).strip()
 
 KST = timezone(timedelta(hours=9))
-CARD_LINE = "━━━━━━━━━━━━━━"
+CARD_LINE = "━━━━━━━━━━━━"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v12_2_approval_flow")
+logger = logging.getLogger("sinsa_event_bot_v12_3_compact_ui")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -490,6 +490,23 @@ def fmt_kst(value: str, empty="미설정") -> str:
     return dt.strftime("%Y.%m.%d %H:%M") if dt else empty
 
 
+def compact_event_period(start_value: str, end_value: str) -> str:
+    start = parse_kst(start_value)
+    end = parse_kst(end_value)
+
+    if not start and not end:
+        return "시간 미설정"
+    if start and not end:
+        return start.strftime("%Y.%m.%d %H:%M") + " ~"
+    if end and not start:
+        return "~ " + end.strftime("%Y.%m.%d %H:%M")
+
+    if start.date() == end.date():
+        return f"{start.strftime('%Y.%m.%d %H:%M')} ~ {end.strftime('%H:%M')}"
+
+    return f"{start.strftime('%Y.%m.%d %H:%M')} ~ {end.strftime('%Y.%m.%d %H:%M')}"
+
+
 def get_event_media(event_id: int) -> list[sqlite3.Row]:
     with db_connect() as conn:
         return conn.execute(
@@ -723,18 +740,15 @@ def proof_guide_html(event: sqlite3.Row) -> str:
 
 
 def event_card(event: sqlite3.Row, admin: bool = False) -> str:
-    deadline_text = event["deadline_at"] or "별도 마감시간 없음"
-    start_text = event["start_at"] or "수동 시작"
-
     text = (
-        f"<b>{field_prefix(event, 'emoji_title')}{event_title_html(event)}</b>\n\n"
+        f"<b>{field_prefix(event, 'emoji_title')}{event_title_html(event)}</b>\n"
         f"{CARD_LINE}\n\n"
         f"<b>{field_prefix(event, 'emoji_content')}이벤트 내용</b>\n"
         f"{event_content_html(event)}\n\n"
-        f"<b>{field_prefix(event, 'emoji_time')}이벤트 시간</b>\n"
-        f"{html.escape(start_text)} ~ {html.escape(deadline_text)}\n\n"
-        f"<b>{field_prefix(event, 'emoji_conditions')}이벤트 조건</b>\n"
-        f"{event_conditions_html(event)}\n\n"
+        f"<b>{field_prefix(event, 'emoji_time')}진행기간</b>\n"
+        f"{html.escape(compact_event_period(event['start_at'], event['deadline_at']))}\n\n"
+        f"<b>{field_prefix(event, 'emoji_conditions')}참여조건</b>\n"
+        f"{event_conditions_html(event)}\n"
         f"{CARD_LINE}"
     )
 
@@ -746,9 +760,9 @@ def event_card(event: sqlite3.Row, admin: bool = False) -> str:
             "ended": "종료",
         }.get(event["status"], event["status"])
         text += (
-            f"\n\n상태 : {status}\n"
-            f"대표 이미지/GIF : {event_media_count(event['id'])}/5개\n"
-            f"이벤트 번호 : <code>#{event['id']}</code>"
+            f"\n상태 : {status}"
+            f"\n대표 이미지/GIF : {event_media_count(event['id'])}/5개"
+            f"\n이벤트 번호 : <code>#{event['id']}</code>"
         )
 
     return text
@@ -786,9 +800,14 @@ def member_event_list_keyboard(events: list[sqlite3.Row]) -> InlineKeyboardMarku
 
 def member_event_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("이 이벤트 참여", callback_data=f"user:apply:{event['id']}")],
-        [InlineKeyboardButton("⬅ 진행 이벤트 목록", callback_data="user:event_list")],
-        [premium_button("내 신청 상태", "user:status", get_setting("status_button_emoji_id", ""), get_setting("status_button_emoji", ""))],
+        [InlineKeyboardButton("이벤트 참여", callback_data=f"user:apply:{event['id']}")],
+        [InlineKeyboardButton("진행 이벤트 목록", callback_data="user:event_list")],
+        [premium_button(
+            "내 신청 상태",
+            "user:status",
+            get_setting("status_button_emoji_id", ""),
+            get_setting("status_button_emoji", "")
+        )],
     ])
 
 
@@ -955,7 +974,7 @@ def group_settings_keyboard() -> InlineKeyboardMarkup:
 
 
 def simple_back(event_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ 이벤트 관리", callback_data=f"event:manage:{event_id}")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("이벤트 관리", callback_data=f"event:manage:{event_id}")]])
 
 
 def get_user_event_application(event_id: int, user_id: int) -> Optional[sqlite3.Row]:
@@ -1075,6 +1094,7 @@ def render_event_notice(event: sqlite3.Row, kind: str) -> str:
                 "{start_at}": html.escape(fmt_kst(event["start_at"], "지금부터")),
                 "{deadline_at}": html.escape(fmt_kst(event["deadline_at"], "별도 마감 없음")),
                 "{conditions}": event_conditions_html(event),
+                "{period}": html.escape(compact_event_period(event["start_at"], event["deadline_at"])),
             }
             rendered = template
             for key, value in replacements.items():
@@ -1082,25 +1102,23 @@ def render_event_notice(event: sqlite3.Row, kind: str) -> str:
             return rendered
 
         return (
-            f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n\n"
+            f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n"
             f"{CARD_LINE}\n\n"
             f"<b>{field_prefix(event,'emoji_content')}이벤트 내용</b>\n"
             f"{event_content_html(event)}\n\n"
-            f"<b>{field_prefix(event,'emoji_time')}이벤트 시간</b>\n"
-            f"{html.escape(fmt_kst(event['start_at'], '지금부터'))} ~ "
-            f"{html.escape(fmt_kst(event['deadline_at'], '별도 마감 없음'))}\n\n"
-            f"<b>{field_prefix(event,'emoji_conditions')}이벤트 조건</b>\n"
-            f"{event_conditions_html(event)}\n\n"
+            f"<b>{field_prefix(event,'emoji_time')}진행기간</b>\n"
+            f"{html.escape(compact_event_period(event['start_at'], event['deadline_at']))}\n\n"
+            f"<b>{field_prefix(event,'emoji_conditions')}참여조건</b>\n"
+            f"{event_conditions_html(event)}\n"
             f"{CARD_LINE}"
         )
 
     template = event["end_notice_html"] or ""
     if template:
-        rendered = template.replace(
+        return template.replace(
             "{title}",
             f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>"
         )
-        return rendered
 
     return (
         f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n\n"
@@ -1368,7 +1386,7 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V12.2 APPROVAL FLOW 정상 작동 중")
+    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V12.3 COMPACT UI 정상 작동 중")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1477,18 +1495,17 @@ async def send_application_to_admin(context: ContextTypes.DEFAULT_TYPE, applicat
         caption = None
         if i == 0:
             caption = (
-                "<b>이벤트 참가 신청</b>\n\n"
+                "<b>이벤트 참가 신청</b>\n"
                 f"{CARD_LINE}\n\n"
-                f"<b>{field_prefix(event,'emoji_title')}이벤트</b>\n"
-                f"{html.escape(application['event_title'])}\n\n"
-                f"<b>신청번호</b>\n<code>#{application['id']}</code>\n\n"
-                f"<b>회원</b>\n{html.escape(application['name'] or '이름 없음')}\n\n"
-                f"<b>아이디</b>\n{html.escape(application['username'] or '없음')}\n\n"
-                f"<b>숫자 ID</b>\n<code>{application['user_id']}</code>\n\n"
-                f"<b>{field_prefix(event,'emoji_proof')}인증 이미지</b>\n"
-                f"{len(photos[:5])}장\n\n"
+                f"<b>{field_prefix(event,'emoji_title')}{html.escape(application['event_title'])}</b>\n\n"
+                f"신청번호 : <code>#{application['id']}</code>\n"
+                f"회원 : {html.escape(application['name'] or '이름 없음')}\n"
+                f"아이디 : {html.escape(application['username'] or '없음')}\n"
+                f"회원 ID : <code>{application['user_id']}</code>\n"
+                f"인증 이미지 : {len(photos[:5])}장\n"
                 f"{CARD_LINE}"
             )
+
         media.append(
             InputMediaPhoto(
                 media=file_id,
@@ -1498,13 +1515,9 @@ async def send_application_to_admin(context: ContextTypes.DEFAULT_TYPE, applicat
         )
 
     await context.bot.send_media_group(chat_id=ADMIN_ID, media=media)
-
     await context.bot.send_message(
         chat_id=ADMIN_ID,
-        text=(
-            f"<b>신청 #{application['id']} 처리</b>\n\n"
-            f"회원 ID : <code>{application['user_id']}</code>"
-        ),
+        text=f"<b>신청 #{application['id']} 처리</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_application_keyboard(application["id"]),
     )
@@ -1609,7 +1622,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
         if action == "cancel":
             delete_application(application_id)
             context.user_data.pop("collecting_application_id", None)
-            await query.edit_message_text("🗑 이벤트 참가 신청을 취소했습니다.")
+            await query.edit_message_text("이벤트 참가 신청을 취소했습니다.")
             return
         event = get_event(approw["event_id"])
         if not event or not event_is_open(event):
@@ -2038,7 +2051,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             rich = message_to_html(message)
             set_setting("status_button_emoji", button_emoji_from_html(rich))
             set_setting("status_button_emoji_id", extract_custom_emoji_id_from_message(message))
-        context.user_data.clear(); await message.reply_text("✅ 내 신청상태 버튼 이모지를 저장했습니다.", reply_markup=admin_home_keyboard()); return
+        context.user_data.clear(); await message.reply_text("내 신청상태 버튼 이모지를 저장했습니다.", reply_markup=admin_home_keyboard()); return
 
     if context.user_data.get("edit_group_text"):
         which = context.user_data["edit_group_text"]
@@ -2067,7 +2080,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 if start and dt <= start:
                     await message.reply_text("마감시간은 시작시간보다 뒤여야 합니다."); return
                 set_event_field(event_id, "deadline_at", dt.strftime("%Y-%m-%d %H:%M")); set_event_field(event_id, "end_announced", 0)
-        context.user_data.clear(); await message.reply_text("✅ 시간을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id))); return
+        context.user_data.clear(); await message.reply_text("시간을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id))); return
 
     emoji_event_id = context.user_data.get("edit_emoji_event_id")
     emoji_field = context.user_data.get("edit_emoji_field")
@@ -2077,7 +2090,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             update_event_emoji(emoji_event_id, emoji_field, "", "")
         else:
             update_event_emoji(emoji_event_id, emoji_field, message_to_html(message), extract_custom_emoji_id_from_message(message))
-        context.user_data.clear(); await message.reply_text("✅ 이모지 설정을 저장했습니다.", reply_markup=emoji_manage_keyboard(emoji_event_id)); return
+        context.user_data.clear(); await message.reply_text("이모지 설정을 저장했습니다.", reply_markup=emoji_manage_keyboard(emoji_event_id)); return
 
     edit_event_id = context.user_data.get("edit_event_id")
     field = context.user_data.get("edit_event_field")
@@ -2120,7 +2133,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V12.2 APPROVAL FLOW 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V12.3 COMPACT UI 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
