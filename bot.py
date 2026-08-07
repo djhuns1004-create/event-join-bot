@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V11.1 SIMPLE
+# 신사 이벤트 참여봇 V12 CLEAN FINAL
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -54,7 +54,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v11_1_simple")
+logger = logging.getLogger("sinsa_event_bot_v12_clean_final")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -343,6 +343,44 @@ def init_db() -> None:
                     )
         except Exception:
             logger.exception("기존 대표미디어 자동 이전 실패")
+
+        # V11.2: 그룹 공지는 별도 ON/OFF 없이 자동 사용
+        try:
+            conn.execute("""
+                UPDATE events
+                SET announce_start=1,
+                    announce_end=1
+                WHERE status != 'deleted'
+            """)
+            conn.execute(
+                "INSERT INTO settings_v8(key,value) VALUES('group_start_notice_enabled','1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+            conn.execute(
+                "INSERT INTO settings_v8(key,value) VALUES('group_end_notice_enabled','1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+        except Exception:
+            logger.exception("자동공지 기본값 적용 실패")
+
+        # V12: 시작/종료 그룹공지는 별도 설정 없이 항상 자동 사용
+        try:
+            conn.execute("""
+                UPDATE events
+                SET announce_start=1,
+                    announce_end=1
+                WHERE status != 'deleted'
+            """)
+            conn.execute(
+                "INSERT INTO settings_v8(key,value) VALUES('group_start_notice_enabled','1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+            conn.execute(
+                "INSERT INTO settings_v8(key,value) VALUES('group_end_notice_enabled','1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+        except Exception:
+            logger.exception("자동 그룹공지 기본값 적용 실패")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_v9_event_user ON applications_v6(event_id,user_id,id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_v9_status ON applications_v6(status,id DESC)")
@@ -696,7 +734,7 @@ def event_card(event: sqlite3.Row, admin: bool = False) -> str:
 
 
 def no_event_card() -> str:
-    return "📭 <b>현재 참여할 수 있는 이벤트가 없습니다.</b>\n\n새 이벤트가 등록되면 다시 이용해주세요."
+    return "<b>현재 참여할 수 있는 이벤트가 없습니다.</b>\n\n새 이벤트가 등록되면 다시 이용해주세요."
 
 
 def member_no_event_keyboard() -> InlineKeyboardMarkup:
@@ -719,7 +757,7 @@ def member_event_list_keyboard(events: list[sqlite3.Row]) -> InlineKeyboardMarku
 
 def member_event_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎁 이 이벤트 참여", callback_data=f"user:apply:{event['id']}")],
+        [InlineKeyboardButton("이 이벤트 참여", callback_data=f"user:apply:{event['id']}")],
         [InlineKeyboardButton("⬅ 진행 이벤트 목록", callback_data="user:event_list")],
         [premium_button("내 신청 상태", "user:status", get_setting("status_button_emoji_id", ""), get_setting("status_button_emoji", ""))],
     ])
@@ -769,12 +807,14 @@ def reject_reason_keyboard(application_id: int) -> InlineKeyboardMarkup:
 
 def admin_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ 이벤트 새로 등록", callback_data="admin:new_event")],
-        [InlineKeyboardButton("📚 전체 이벤트 관리", callback_data="admin:event_list")],
-        [InlineKeyboardButton("📋 전체 승인 대기", callback_data="admin:pending"), InlineKeyboardButton("📊 전체 신청 현황", callback_data="admin:stats")],
-        [InlineKeyboardButton("🔗 그룹/공지 설정", callback_data="admin:group")],
-        [InlineKeyboardButton("✨ 이모지 설정", callback_data="admin:emoji")],
-        [InlineKeyboardButton("❌ 관리자 메뉴 닫기", callback_data="admin:close")],
+        [InlineKeyboardButton("이벤트 새로 등록", callback_data="admin:new_event")],
+        [InlineKeyboardButton("전체 이벤트 관리", callback_data="admin:event_list")],
+        [
+            InlineKeyboardButton("전체 승인 대기", callback_data="admin:pending"),
+            InlineKeyboardButton("전체 신청 현황", callback_data="admin:stats")
+        ],
+        [InlineKeyboardButton("이모지 설정", callback_data="admin:emoji")],
+        [InlineKeyboardButton("관리자 메뉴 닫기", callback_data="admin:close")],
     ])
 
 
@@ -783,74 +823,60 @@ def admin_emoji_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("이벤트 항목 이모지 설정", callback_data="emoji_admin:event_list")],
         [InlineKeyboardButton("내 신청상태 버튼 이모지", callback_data="admin:status_emoji")],
-        [InlineKeyboardButton("⬅ 관리자 메뉴", callback_data="admin:home")],
+        [InlineKeyboardButton("관리자 메뉴", callback_data="admin:home")],
     ])
 
 
 def emoji_event_select_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for event in get_all_events()[:50]:
-        status_icon = {
-            "active": "🟢",
-            "scheduled": "⏰",
-            "draft": "⚪",
-            "ended": "🔴",
-        }.get(event["status"], "▫️")
         rows.append([
             InlineKeyboardButton(
-                f"{status_icon} #{event['id']} {(event['title'] or '')[:25]}",
+                f"#{event['id']} {(event['title'] or '')[:28]}",
                 callback_data=f"emoji_admin:event:{event['id']}",
             )
         ])
     if not rows:
-        rows.append([
-            InlineKeyboardButton(
-                "등록된 이벤트가 없습니다",
-                callback_data="emoji_admin:none",
-            )
-        ])
-    rows.append([InlineKeyboardButton("⬅ 이모지 설정", callback_data="admin:emoji")])
+        rows.append([InlineKeyboardButton("등록된 이벤트가 없습니다", callback_data="emoji_admin:none")])
+    rows.append([InlineKeyboardButton("이모지 설정", callback_data="admin:emoji")])
     return InlineKeyboardMarkup(rows)
 
 
 def admin_event_list_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for event in get_all_events()[:50]:
-        icon = {"active": "🟢", "scheduled": "⏰", "draft": "⚪", "ended": "🔴"}.get(event["status"], "▫️")
-        rows.append([InlineKeyboardButton(f"{icon} #{event['id']} {(event['title'] or '')[:25]}", callback_data=f"event:manage:{event['id']}")])
-    rows += [[InlineKeyboardButton("➕ 이벤트 새로 등록", callback_data="admin:new_event")], [InlineKeyboardButton("⬅ 관리자 메뉴", callback_data="admin:home")]]
+        rows.append([
+            InlineKeyboardButton(
+                f"#{event['id']} {(event['title'] or '')[:28]}",
+                callback_data=f"event:manage:{event['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("이벤트 새로 등록", callback_data="admin:new_event")])
+    rows.append([InlineKeyboardButton("관리자 메뉴", callback_data="admin:home")])
     return InlineKeyboardMarkup(rows)
 
 
 def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("이벤트명 수정", callback_data=f"edit:title:{event['id']}"),
-            InlineKeyboardButton("내용 수정", callback_data=f"edit:content:{event['id']}")
+            InlineKeyboardButton("이벤트명", callback_data=f"edit:title:{event['id']}"),
+            InlineKeyboardButton("이벤트 내용", callback_data=f"edit:content:{event['id']}")
         ],
         [
-            InlineKeyboardButton("이벤트 시간 설정", callback_data=f"schedule:start:{event['id']}"),
-            InlineKeyboardButton("마감시간 설정", callback_data=f"schedule:end:{event['id']}")
+            InlineKeyboardButton("시작시간", callback_data=f"schedule:start:{event['id']}"),
+            InlineKeyboardButton("마감시간", callback_data=f"schedule:end:{event['id']}")
         ],
+        [InlineKeyboardButton("이벤트 조건", callback_data=f"edit:conditions:{event['id']}")],
+        [InlineKeyboardButton("대표 이미지/GIF", callback_data=f"media:set:{event['id']}")],
         [
-            InlineKeyboardButton("이벤트 조건 수정", callback_data=f"edit:conditions:{event['id']}")
+            InlineKeyboardButton("시작공지 문구", callback_data=f"edit:start_notice:{event['id']}"),
+            InlineKeyboardButton("종료공지 문구", callback_data=f"edit:end_notice:{event['id']}")
         ],
-        [
-            InlineKeyboardButton("대표 이미지/GIF", callback_data=f"media:set:{event['id']}")
-        ],
-        [
-            InlineKeyboardButton("공지 시작문구 수정", callback_data=f"edit:start_notice:{event['id']}"),
-            InlineKeyboardButton("공지 종료문구 수정", callback_data=f"edit:end_notice:{event['id']}")
-        ],
-        [
-            InlineKeyboardButton("이모지 설정", callback_data=f"emoji:menu:{event['id']}")
-        ],
-        [
-            InlineKeyboardButton("미리보기", callback_data=f"event:preview:{event['id']}")
-        ],
+        [InlineKeyboardButton("이모지 설정", callback_data=f"emoji:menu:{event['id']}")],
+        [InlineKeyboardButton("미리보기", callback_data=f"event:preview:{event['id']}")],
         [
             InlineKeyboardButton("승인 대기", callback_data=f"event:pending:{event['id']}"),
-            InlineKeyboardButton("이벤트 현황", callback_data=f"event:stats:{event['id']}")
+            InlineKeyboardButton("신청 현황", callback_data=f"event:stats:{event['id']}")
         ],
     ]
 
@@ -877,22 +903,14 @@ def emoji_manage_keyboard(event_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("시간 이모지", callback_data=f"emoji_edit:emoji_time:{event_id}"),
             InlineKeyboardButton("조건 이모지", callback_data=f"emoji_edit:emoji_conditions:{event_id}")
         ],
-        [
-            InlineKeyboardButton("모든 이모지 제거", callback_data=f"emoji:clear:{event_id}")
-        ],
-        [
-            InlineKeyboardButton("이벤트 관리", callback_data=f"event:manage:{event_id}")
-        ],
+        [InlineKeyboardButton("모든 이모지 제거", callback_data=f"emoji:clear:{event_id}")],
+        [InlineKeyboardButton("이벤트 관리", callback_data=f"event:manage:{event_id}")],
     ])
 
 
 def group_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 시작 전체공지 ON/OFF", callback_data="group:toggle_start")],
-        [InlineKeyboardButton("🔒 마감 전체공지 ON/OFF", callback_data="group:toggle_end")],
-        [InlineKeyboardButton("✏ 시작 공지문구 수정", callback_data="group:text_start")],
-        [InlineKeyboardButton("✏ 마감 공지문구 수정", callback_data="group:text_end")],
-        [InlineKeyboardButton("⬅ 관리자 메뉴", callback_data="admin:home")],
+        [InlineKeyboardButton("관리자 메뉴", callback_data="admin:home")]
     ])
 
 
@@ -1172,15 +1190,11 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
         return False, "이벤트를 찾을 수 없습니다."
 
     if kind == "start":
-        if not manual and (not event["announce_start"] or get_setting("group_start_notice_enabled", "1") != "1"):
-            return True, "시작 공지 OFF"
         text = render_event_notice(event, "start")
         link = await bot_deep_link(application, event_id)
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("이벤트 참여하기", url=link)]])
 
     else:
-        if not manual and (not event["announce_end"] or get_setting("group_end_notice_enabled", "1") != "1"):
-            return True, "마감 공지 OFF"
         text = render_event_notice(event, "end")
         markup = None
 
@@ -1239,8 +1253,7 @@ async def scheduler_loop(application: Application):
                         event = get_event(event["id"])
 
                     if event and not event["start_announced"]:
-                        if event["announce_start"] and get_setting("group_start_notice_enabled", "1") == "1":
-                            await send_group_notice(application, event["id"], "start", manual=False)
+                        await send_group_notice(application, event["id"], "start", manual=False)
 
                 # 마감시간 도달 시 무조건 자동 종료
                 if end and now >= end:
@@ -1255,8 +1268,7 @@ async def scheduler_loop(application: Application):
 
                     # Railway 재시작 후 마감공지를 놓친 경우에도 복구
                     if event and not event["end_announced"]:
-                        if event["announce_end"] and get_setting("group_end_notice_enabled", "1") == "1":
-                            await send_group_notice(application, event["id"], "end", manual=False)
+                        await send_group_notice(application, event["id"], "end", manual=False)
 
         except asyncio.CancelledError:
             raise
@@ -1287,7 +1299,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not events:
         await update.effective_message.reply_text(no_event_card(), parse_mode=ParseMode.HTML, reply_markup=member_no_event_keyboard())
         return
-    await update.effective_message.reply_text("<b>🎉 진행 중인 이벤트를 선택해주세요.</b>", parse_mode=ParseMode.HTML, reply_markup=member_event_list_keyboard(events))
+    await update.effective_message.reply_text("<b>진행 중인 이벤트를 선택해주세요.</b>", parse_mode=ParseMode.HTML, reply_markup=member_event_list_keyboard(events))
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1316,7 +1328,7 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V11.1 SIMPLE 정상 작동 중")
+    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V12 CLEAN FINAL 정상 작동 중")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1451,7 +1463,7 @@ async def send_pending(message, event_id: Optional[int] = None) -> None:
     if not rows:
         await message.reply_text("📭 승인 대기 신청이 없습니다.", reply_markup=event_manage_keyboard(get_event(event_id)) if event_id else admin_home_keyboard())
         return
-    lines = ["📋 <b>승인 대기 목록</b>\n"]
+    lines = ["<b>승인 대기 목록</b>\n"]
     for row in rows:
         lines.append(f"📌 #{row['id']} / {html.escape(row['event_title'])}\n👤 {html.escape(row['name'] or '-')}\n🆔 <code>{row['user_id']}</code>\n📸 {application_photo_count(row['id'])}장\n──────────────")
     await message.reply_text("\n".join(lines)[:4000], parse_mode=ParseMode.HTML, reply_markup=event_manage_keyboard(get_event(event_id)) if event_id else admin_home_keyboard())
@@ -1468,7 +1480,7 @@ async def send_stats(message, event_id: Optional[int] = None) -> None:
         counts[row["status"]] = row["count"]
     event = get_event(event_id) if event_id else None
     await message.reply_text(
-        "📊 <b>이벤트 신청 현황</b>\n\n"
+        "<b>이벤트 신청 현황</b>\n\n"
         f"🎉 {event_title_html(event) if event else '전체 이벤트'}\n\n"
         f"📸 사진 등록 중 : {counts.get('collecting',0)}건\n"
         f"⏳ 승인 대기 : {counts.get('pending',0)}건\n"
@@ -1499,7 +1511,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             return
         if action == "event_list":
             events = get_active_events()
-            await query.edit_message_text("<b>🎉 진행 중인 이벤트를 선택해주세요.</b>" if events else no_event_card(), parse_mode=ParseMode.HTML, reply_markup=member_event_list_keyboard(events) if events else member_no_event_keyboard())
+            await query.edit_message_text("<b>진행 중인 이벤트를 선택해주세요.</b>" if events else no_event_card(), parse_mode=ParseMode.HTML, reply_markup=member_event_list_keyboard(events) if events else member_no_event_keyboard())
             return
         if action == "event":
             event_id = int(parts[2])
@@ -1644,31 +1656,11 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=admin_emoji_keyboard(),
         )
         return
-    if data == "admin:group":
-        title = get_setting("group_title", "미등록") or "미등록"
-        gid = get_setting("group_id", "미등록") or "미등록"
-        await query.edit_message_text(
-            "🔗 <b>그룹/공지 설정</b>\n\n"
-            f"현재 그룹 : {html.escape(title)}\nID : <code>{html.escape(gid)}</code>\n\n"
-            "그룹 등록: 봇을 그룹에 추가한 뒤 관리자 계정으로 <code>/setgroup</code>\n\n"
-            f"전체 시작공지 : {'ON' if get_setting('group_start_notice_enabled','1')=='1' else 'OFF'}\n"
-            f"전체 마감공지 : {'ON' if get_setting('group_end_notice_enabled','1')=='1' else 'OFF'}",
-            parse_mode=ParseMode.HTML, reply_markup=group_settings_keyboard())
-        return
-
-    if data.startswith("group:"):
-        action = data.split(":")[1]
-        if action == "toggle_start":
-            set_setting("group_start_notice_enabled", "0" if get_setting("group_start_notice_enabled", "1") == "1" else "1")
-        elif action == "toggle_end":
-            set_setting("group_end_notice_enabled", "0" if get_setting("group_end_notice_enabled", "1") == "1" else "1")
-        elif action == "text_start":
-            context.user_data.clear(); context.user_data["edit_group_text"] = "start"
-            await query.edit_message_text("시작 공지 문구를 입력해주세요.\n\n변수: <code>{event}</code> <code>{start}</code> <code>{end}</code>\n기본문구로 되돌리려면 <code>기본</code>", parse_mode=ParseMode.HTML, reply_markup=group_settings_keyboard()); return
-        elif action == "text_end":
-            context.user_data.clear(); context.user_data["edit_group_text"] = "end"
-            await query.edit_message_text("마감 공지 문구를 입력해주세요.\n\n변수: <code>{event}</code> <code>{end}</code>\n기본문구로 되돌리려면 <code>기본</code>", parse_mode=ParseMode.HTML, reply_markup=group_settings_keyboard()); return
-        await query.edit_message_text("✅ 그룹 공지 설정을 변경했습니다.", reply_markup=group_settings_keyboard())
+    if data == "admin:group" or data.startswith("group:"):
+        await query.answer(
+            "그룹 공지 설정 메뉴는 사용하지 않습니다. 그룹에서 /setgroup 한 번만 등록하면 자동 공지됩니다.",
+            show_alert=True,
+        )
         return
 
     if data.startswith("event:"):
@@ -1708,7 +1700,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith("edit:"):
         _, field, event_id_text = data.split(":")
         event_id = int(event_id_text)
-        labels = {"title":"이벤트명", "content":"이벤트 내용", "participation_time":"참가시간 문구", "conditions":"참여조건", "proof_guide":"인증안내", "pre_notice":"10분전 예고공지 문구", "start_notice":"시작공지 문구", "end_notice":"마감공지 문구", "approval":"승인문구", "rejection":"거절문구"}
+        labels = {"title":"이벤트명", "content":"이벤트 내용", "participation_time":"이벤트 시간", "conditions":"이벤트 조건", "proof_guide":"인증안내", "pre_notice":"예고공지 문구", "start_notice":"시작공지 문구", "end_notice":"종료공지 문구", "approval":"승인문구", "rejection":"거절문구"}
         context.user_data.clear(); context.user_data["edit_event_id"] = event_id; context.user_data["edit_event_field"] = field
         extra = ""
         if field == "pre_notice":
@@ -1996,7 +1988,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V11.1 SIMPLE 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V12 CLEAN FINAL 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
