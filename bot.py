@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V9.6
+# 신사 이벤트 참여봇 V9.7
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -53,7 +53,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v9_6")
+logger = logging.getLogger("sinsa_event_bot_v9_7")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -134,6 +134,10 @@ def init_db() -> None:
                 emoji_proof TEXT NOT NULL DEFAULT '',
                 proof_guide TEXT NOT NULL DEFAULT '당일 채팅기록 또는 당일 제휴 이용내역 등 이벤트 조건을 확인할 수 있는 이미지를 등록해주세요.',
                 proof_guide_html TEXT NOT NULL DEFAULT '당일 채팅기록 또는 당일 제휴 이용내역 등 이벤트 조건을 확인할 수 있는 이미지를 등록해주세요.',
+                start_notice_text TEXT NOT NULL DEFAULT '',
+                start_notice_html TEXT NOT NULL DEFAULT '',
+                end_notice_text TEXT NOT NULL DEFAULT '',
+                end_notice_html TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'draft',
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT '',
@@ -167,6 +171,10 @@ def init_db() -> None:
             ("emoji_proof", "TEXT NOT NULL DEFAULT ''"),
             ("proof_guide", "TEXT NOT NULL DEFAULT '당일 채팅기록 또는 당일 제휴 이용내역 등 이벤트 조건을 확인할 수 있는 이미지를 등록해주세요.'"),
             ("proof_guide_html", "TEXT NOT NULL DEFAULT '당일 채팅기록 또는 당일 제휴 이용내역 등 이벤트 조건을 확인할 수 있는 이미지를 등록해주세요.'"),
+            ("start_notice_text", "TEXT NOT NULL DEFAULT ''"),
+            ("start_notice_html", "TEXT NOT NULL DEFAULT ''"),
+            ("end_notice_text", "TEXT NOT NULL DEFAULT ''"),
+            ("end_notice_html", "TEXT NOT NULL DEFAULT ''"),
             ("status", "TEXT NOT NULL DEFAULT 'draft'"),
             ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ("updated_at", "TEXT NOT NULL DEFAULT ''"),
@@ -409,6 +417,8 @@ def update_event_text(event_id: int, field: str, plain_value: str, html_value: s
         "participation_time": ("participation_time", "participation_time_html"),
         "conditions": ("conditions", "conditions_html"),
         "proof_guide": ("proof_guide", "proof_guide_html"),
+        "start_notice": ("start_notice_text", "start_notice_html"),
+        "end_notice": ("end_notice_text", "end_notice_html"),
         "approval": ("approval_text", "approval_html"),
         "rejection": ("rejection_text", "rejection_html"),
     }
@@ -685,6 +695,7 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("참가시간 문구", callback_data=f"edit:participation_time:{event['id']}"), InlineKeyboardButton("참여조건 수정", callback_data=f"edit:conditions:{event['id']}")],
         [InlineKeyboardButton("⏰ 시작시간 설정", callback_data=f"schedule:start:{event['id']}"), InlineKeyboardButton("🔒 마감시간 설정", callback_data=f"schedule:end:{event['id']}")],
         [InlineKeyboardButton("인증안내 수정", callback_data=f"edit:proof_guide:{event['id']}"), InlineKeyboardButton("🖼 대표 이미지/GIF", callback_data=f"media:set:{event['id']}")],
+        [InlineKeyboardButton("시작공지 문구 수정", callback_data=f"edit:start_notice:{event['id']}"), InlineKeyboardButton("마감공지 문구 수정", callback_data=f"edit:end_notice:{event['id']}")],
         [InlineKeyboardButton("✅ 승인문구", callback_data=f"edit:approval:{event['id']}"), InlineKeyboardButton("❌ 거절문구", callback_data=f"edit:rejection:{event['id']}")],
         [InlineKeyboardButton("✨ 이모지 설정", callback_data=f"emoji:menu:{event['id']}")],
         [InlineKeyboardButton(f"📢 시작공지 {'ON' if event['announce_start'] else 'OFF'}", callback_data=f"toggle:start_notice:{event['id']}"), InlineKeyboardButton(f"🔒 마감공지 {'ON' if event['announce_end'] else 'OFF'}", callback_data=f"toggle:end_notice:{event['id']}")],
@@ -844,6 +855,41 @@ async def bot_deep_link(application: Application, event_id: int) -> str:
     return f"https://t.me/{username}?start=event_{event_id}"
 
 
+def render_event_notice(event: sqlite3.Row, kind: str) -> str:
+    if kind == "start":
+        template = event["start_notice_html"] or ""
+        if not template:
+            return (
+                "<b>EVENT OPEN</b>\n\n"
+                f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n\n"
+                f"{event_content_html(event)}\n\n"
+                f"<b>{field_prefix(event,'emoji_time')}참여기간</b>\n{html.escape(fmt_kst(event['start_at'], '지금부터'))} ~ {html.escape(fmt_kst(event['deadline_at'], '별도 마감 없음'))}\n\n"
+                f"<b>{field_prefix(event,'emoji_conditions')}참여조건</b>\n{event_conditions_html(event)}\n\n"
+                f"<b>{field_prefix(event,'emoji_proof')}인증안내</b>\n{proof_guide_html(event)}\n\n"
+                "아래 버튼을 눌러 이벤트에 참여해주세요."
+            )
+    else:
+        template = event["end_notice_html"] or ""
+        if not template:
+            return (
+                "<b>EVENT CLOSED</b>\n\n"
+                f"<b>{event_title_html(event)}</b> 참여가 마감되었습니다.\n\n"
+                "접수된 신청은 관리자 확인 후 순차적으로 처리됩니다."
+            )
+
+    replacements = {
+        "{title}": event_title_html(event),
+        "{start_at}": html.escape(fmt_kst(event["start_at"], "지금부터")),
+        "{deadline_at}": html.escape(fmt_kst(event["deadline_at"], "별도 마감 없음")),
+        "{conditions}": event_conditions_html(event),
+        "{proof_guide}": proof_guide_html(event),
+    }
+    rendered = template
+    for key, value in replacements.items():
+        rendered = rendered.replace(key, value)
+    return rendered
+
+
 async def send_group_notice(application: Application, event_id: int, kind: str, manual=False) -> tuple[bool, str]:
     group_id = get_setting("group_id", "").strip()
     if not group_id:
@@ -855,20 +901,14 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
     if kind == "start":
         if not manual and (not event["announce_start"] or get_setting("group_start_notice_enabled", "1") != "1"):
             return True, "시작 공지 OFF"
-        custom = get_setting("group_start_text", "").strip()
-        if custom:
-            text = custom.replace("{event}", event["title"]).replace("{start}", fmt_kst(event["start_at"])).replace("{end}", fmt_kst(event["deadline_at"]))
-            text = html.escape(text)
+        if event["start_notice_html"]:
+            text = render_event_notice(event, "start")
         else:
-            text = (
-                "<b>EVENT OPEN</b>\n\n"
-                f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n\n"
-                f"{event_content_html(event)}\n\n"
-                f"<b>{field_prefix(event,'emoji_time')}참여기간</b>\n{html.escape(fmt_kst(event['start_at'], '지금부터'))} ~ {html.escape(fmt_kst(event['deadline_at'], '별도 마감 없음'))}\n\n"
-                f"<b>{field_prefix(event,'emoji_conditions')}참여조건</b>\n{event_conditions_html(event)}\n\n"
-                f"<b>{field_prefix(event,'emoji_proof')}인증안내</b>\n{proof_guide_html(event)}\n\n"
-                "아래 버튼을 눌러 이벤트에 참여해주세요."
-            )
+            custom = get_setting("group_start_text", "").strip()
+            if custom:
+                text = html.escape(custom.replace("{event}", event["title"]).replace("{start}", fmt_kst(event["start_at"])).replace("{end}", fmt_kst(event["deadline_at"])))
+            else:
+                text = render_event_notice(event, "start")
         link = await bot_deep_link(application, event_id)
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 이벤트 참여하기", url=link)]])
         try:
@@ -882,15 +922,14 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
 
     if not manual and (not event["announce_end"] or get_setting("group_end_notice_enabled", "1") != "1"):
         return True, "마감 공지 OFF"
-    custom = get_setting("group_end_text", "").strip()
-    if custom:
-        text = html.escape(custom.replace("{event}", event["title"]).replace("{end}", fmt_kst(event["deadline_at"])))
+    if event["end_notice_html"]:
+        text = render_event_notice(event, "end")
     else:
-        text = (
-            "🔒 <b>EVENT CLOSED</b>\n\n"
-            f"<b>{event_title_html(event)}</b> 참여가 마감되었습니다.\n\n"
-            "접수된 신청은 관리자 확인 후 순차적으로 처리됩니다."
-        )
+        custom = get_setting("group_end_text", "").strip()
+        if custom:
+            text = html.escape(custom.replace("{event}", event["title"]).replace("{end}", fmt_kst(event["deadline_at"])))
+        else:
+            text = render_event_notice(event, "end")
     try:
         await application.bot.send_message(int(group_id), text, parse_mode=ParseMode.HTML)
     except Exception as exc:
@@ -922,7 +961,7 @@ async def scheduler_loop(application: Application):
                 start = parse_kst(event["start_at"])
                 end = parse_kst(event["deadline_at"])
 
-                if start and now >= start and (not end or now <= end) and event["status"] in {"draft", "scheduled", "ended"}:
+                if start and now >= start and (not end or now <= end) and event["status"] in {"draft", "scheduled"}:
                     start_event(event["id"], manual=False)
                     event = get_event(event["id"])
 
@@ -932,7 +971,7 @@ async def scheduler_loop(application: Application):
                         if ok:
                             set_event_field(event["id"], "start_announced", 1)
 
-                if end and now > end:
+                if end and now >= end:
                     if event["status"] != "ended":
                         end_event(event["id"])
                     if not event["end_announced"] and event["announce_end"] and get_setting("group_end_notice_enabled", "1") == "1":
@@ -996,7 +1035,7 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V9.6 정상 작동 중")
+    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V9.7 정상 작동 중")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1341,9 +1380,14 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith("edit:"):
         _, field, event_id_text = data.split(":")
         event_id = int(event_id_text)
-        labels = {"title":"이벤트명", "content":"이벤트 내용", "participation_time":"참가시간 문구", "conditions":"참여조건", "proof_guide":"인증안내", "approval":"승인문구", "rejection":"거절문구"}
+        labels = {"title":"이벤트명", "content":"이벤트 내용", "participation_time":"참가시간 문구", "conditions":"참여조건", "proof_guide":"인증안내", "start_notice":"시작공지 문구", "end_notice":"마감공지 문구", "approval":"승인문구", "rejection":"거절문구"}
         context.user_data.clear(); context.user_data["edit_event_id"] = event_id; context.user_data["edit_event_field"] = field
-        await query.edit_message_text(f"<b>{labels.get(field,field)} 수정</b>\n\n새 내용을 보내주세요. 일반/프리미엄 이모지도 사용할 수 있습니다.", parse_mode=ParseMode.HTML, reply_markup=simple_back(event_id)); return
+        extra = ""
+        if field == "start_notice":
+            extra = "\n\n사용 가능 변수: <code>{title}</code> <code>{start_at}</code> <code>{deadline_at}</code> <code>{conditions}</code> <code>{proof_guide}</code>"
+        elif field == "end_notice":
+            extra = "\n\n사용 가능 변수: <code>{title}</code> <code>{deadline_at}</code>"
+        await query.edit_message_text(f"<b>{labels.get(field,field)} 수정</b>\n\n새 내용을 보내주세요. 일반/프리미엄 이모지도 사용할 수 있습니다.{extra}", parse_mode=ParseMode.HTML, reply_markup=simple_back(event_id)); return
 
     if data.startswith("schedule:"):
         _, which, event_id_text = data.split(":")
@@ -1548,7 +1592,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V9.6 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V9.7 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
