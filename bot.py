@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V13 AUTO SCHEDULE FINAL
+# 신사 이벤트 참여봇 V14 MANUAL ONOFF
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -54,7 +54,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v13_auto_schedule_final")
+logger = logging.getLogger("sinsa_event_bot_v14_manual_onoff")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -159,6 +159,7 @@ def init_db() -> None:
                 pre_notice_message_type TEXT NOT NULL DEFAULT '',
                 start_notice_message_type TEXT NOT NULL DEFAULT '',
                 end_notice_message_type TEXT NOT NULL DEFAULT '',
+                manual_mode INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'draft',
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT '',
@@ -216,6 +217,7 @@ def init_db() -> None:
             ("pre_notice_message_type", "TEXT NOT NULL DEFAULT ''"),
             ("start_notice_message_type", "TEXT NOT NULL DEFAULT ''"),
             ("end_notice_message_type", "TEXT NOT NULL DEFAULT ''"),
+            ("manual_mode", "INTEGER NOT NULL DEFAULT 0"),
             ("status", "TEXT NOT NULL DEFAULT 'draft'"),
             ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ("updated_at", "TEXT NOT NULL DEFAULT ''"),
@@ -648,7 +650,8 @@ def set_event_field(event_id: int, field: str, value) -> None:
         "pre_media_file_id", "pre_media_type", "start_media_file_id", "start_media_type",
         "end_media_file_id", "end_media_type",
         "pre_notice_message_id", "start_notice_message_id", "end_notice_message_id",
-        "pre_notice_message_type", "start_notice_message_type", "end_notice_message_type"
+        "pre_notice_message_type", "start_notice_message_type", "end_notice_message_type",
+        "manual_mode"
     }
     if field not in allowed:
         raise ValueError("잘못된 이벤트 설정입니다.")
@@ -678,39 +681,71 @@ def delete_event(event_id: int) -> None:
 
 
 def event_time_window_open(event: sqlite3.Row) -> bool:
-    """설정된 시작/마감시간 범위 안에서만 True."""
+    """
+    회원 참여 가능 여부.
+    manual_mode:
+      0 = 예약시간 기준
+      1 = 관리자 수동 ON (시작시간보다 일찍 열 수 있음)
+      2 = 관리자 수동 OFF
+    """
+    mode = int(event["manual_mode"] or 0)
     now = now_dt()
-    start = parse_kst(event["start_at"])
     end = parse_kst(event["deadline_at"])
 
-    # 시작시간이나 마감시간 둘 중 하나라도 없으면 회원 참여 불가
-    if not start or not end:
+    if mode == 2:
         return False
 
-    return start <= now < end
+    if mode == 1:
+        # 수동 ON도 설정된 마감시간이 지나면 자동 종료
+        return bool(event["status"] == "active" and (not end or now < end))
+
+    start = parse_kst(event["start_at"])
+    if not start or not end:
+        return False
+    return bool(event["status"] == "active" and start <= now < end)
 
 
 def refresh_event_states_sync() -> None:
-    """
-    현재 KST 기준으로 이벤트 상태를 엄격하게 동기화합니다.
-    - 시작 전: scheduled
-    - 시작~마감 전: active
-    - 마감 도달/경과: ended
-    """
+    """KST 기준 예약 상태와 수동 ON/OFF 상태를 안전하게 동기화합니다."""
     now = now_dt()
 
     with db_connect() as conn:
         rows = conn.execute(
-            "SELECT id,status,start_at,deadline_at FROM events WHERE status!='deleted'"
+            "SELECT id,status,start_at,deadline_at,manual_mode FROM events WHERE status!='deleted'"
         ).fetchall()
 
         for row in rows:
+            mode = int(row["manual_mode"] or 0)
             start = parse_kst(row["start_at"])
             end = parse_kst(row["deadline_at"])
 
-            # 시간이 완전히 설정되지 않은 이벤트는 회원에게 절대 공개하지 않음
+            # 관리자 수동 OFF: 스케줄러가 다시 살리지 않음
+            if mode == 2:
+                if row["status"] != "ended":
+                    conn.execute(
+                        "UPDATE events SET status='ended',ended_at=COALESCE(ended_at,?),updated_at=? WHERE id=?",
+                        (now_kst(), now_kst(), row["id"]),
+                    )
+                continue
+
+            # 관리자 수동 ON: 마감 전까지 active 유지, 마감되면 ended
+            if mode == 1:
+                if end and now >= end:
+                    if row["status"] != "ended":
+                        conn.execute(
+                            "UPDATE events SET status='ended',ended_at=COALESCE(ended_at,?),updated_at=? WHERE id=?",
+                            (now_kst(), now_kst(), row["id"]),
+                        )
+                elif row["status"] != "active":
+                    conn.execute(
+                        "UPDATE events SET status='active',started_at=COALESCE(started_at,?),ended_at=NULL,updated_at=? WHERE id=?",
+                        (now_kst(), now_kst(), row["id"]),
+                    )
+                continue
+
+            # 예약자동 모드
             if not start or not end:
-                if row["status"] not in {"draft", "deleted"}:
+                if row["status"] != "draft":
                     conn.execute(
                         "UPDATE events SET status='draft',updated_at=? WHERE id=?",
                         (now_kst(), row["id"]),
@@ -727,36 +762,17 @@ def refresh_event_states_sync() -> None:
             if row["status"] != new_status:
                 if new_status == "active":
                     conn.execute(
-                        """
-                        UPDATE events
-                        SET status='active',
-                            started_at=COALESCE(started_at,?),
-                            ended_at=NULL,
-                            updated_at=?
-                        WHERE id=?
-                        """,
+                        "UPDATE events SET status='active',started_at=COALESCE(started_at,?),ended_at=NULL,updated_at=? WHERE id=?",
                         (now_kst(), now_kst(), row["id"]),
                     )
                 elif new_status == "ended":
                     conn.execute(
-                        """
-                        UPDATE events
-                        SET status='ended',
-                            ended_at=COALESCE(ended_at,?),
-                            updated_at=?
-                        WHERE id=?
-                        """,
+                        "UPDATE events SET status='ended',ended_at=COALESCE(ended_at,?),updated_at=? WHERE id=?",
                         (now_kst(), now_kst(), row["id"]),
                     )
                 else:
                     conn.execute(
-                        """
-                        UPDATE events
-                        SET status='scheduled',
-                            ended_at=NULL,
-                            updated_at=?
-                        WHERE id=?
-                        """,
+                        "UPDATE events SET status='scheduled',ended_at=NULL,updated_at=? WHERE id=?",
                         (now_kst(), row["id"]),
                     )
 
@@ -834,10 +850,12 @@ def event_card(event: sqlite3.Row, admin: bool = False) -> str:
             "active": "진행중",
             "ended": "종료",
         }.get(event["status"], event["status"])
+        mode = int(event["manual_mode"] or 0)
+        mode_text = {0: "예약 자동", 1: "수동 ON", 2: "수동 OFF"}.get(mode, "예약 자동")
         text += (
             f"\n상태 : {status}"
+            f"\n운영 : {mode_text}"
             f"\n대표 이미지/GIF : {event_media_count(event['id'])}/5개"
-            f"\n이벤트 번호 : <code>#{event['id']}</code>"
         )
 
     return text
@@ -954,9 +972,10 @@ def admin_emoji_keyboard() -> InlineKeyboardMarkup:
 def emoji_event_select_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for event in get_all_events()[:50]:
+        title = (event["title"] or "제목 없음")[:30]
         rows.append([
             InlineKeyboardButton(
-                f"#{event['id']} {(event['title'] or '')[:28]}",
+                title,
                 callback_data=f"emoji_admin:event:{event['id']}",
             )
         ])
@@ -969,9 +988,10 @@ def emoji_event_select_keyboard() -> InlineKeyboardMarkup:
 def admin_event_list_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for event in get_all_events()[:50]:
+        title = (event["title"] or "제목 없음")[:30]
         rows.append([
             InlineKeyboardButton(
-                f"#{event['id']} {(event['title'] or '')[:28]}",
+                title,
                 callback_data=f"event:manage:{event['id']}",
             )
         ])
@@ -981,7 +1001,17 @@ def admin_event_list_keyboard() -> InlineKeyboardMarkup:
 
 
 def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
+    manual_mode = int(event["manual_mode"] or 0)
+
+    if manual_mode == 1 and event["status"] == "active":
+        toggle_text = "이벤트 OFF"
+        toggle_data = f"event_toggle:off:{event['id']}"
+    else:
+        toggle_text = "이벤트 ON"
+        toggle_data = f"event_toggle:on:{event['id']}"
+
     rows = [
+        [InlineKeyboardButton(toggle_text, callback_data=toggle_data)],
         [
             InlineKeyboardButton("이벤트명", callback_data=f"edit:title:{event['id']}"),
             InlineKeyboardButton("이벤트 내용", callback_data=f"edit:content:{event['id']}")
@@ -1008,11 +1038,6 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
         ],
     ]
 
-    if event["status"] == "active":
-        rows.append([InlineKeyboardButton("이벤트 종료", callback_data=f"event:end:{event['id']}")])
-    else:
-        rows.append([InlineKeyboardButton("이벤트 시작", callback_data=f"event:start:{event['id']}")])
-
     if event["status"] != "active":
         rows.append([InlineKeyboardButton("이벤트 삭제", callback_data=f"event:delete_confirm:{event['id']}")])
 
@@ -1024,16 +1049,16 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
 def emoji_manage_keyboard(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("이벤트명 이모지", callback_data=f"emoji_edit:emoji_title:{event_id}"),
-            InlineKeyboardButton("내용 이모지", callback_data=f"emoji_edit:emoji_content:{event_id}")
+            InlineKeyboardButton("이벤트명", callback_data=f"emoji_edit:emoji_title:{event_id}"),
+            InlineKeyboardButton("이벤트 내용", callback_data=f"emoji_edit:emoji_content:{event_id}")
         ],
         [
-            InlineKeyboardButton("시간 이모지", callback_data=f"emoji_edit:emoji_time:{event_id}"),
-            InlineKeyboardButton("조건 이모지", callback_data=f"emoji_edit:emoji_conditions:{event_id}")
+            InlineKeyboardButton("진행기간", callback_data=f"emoji_edit:emoji_time:{event_id}"),
+            InlineKeyboardButton("이벤트 조건", callback_data=f"emoji_edit:emoji_conditions:{event_id}")
         ],
         [
-            InlineKeyboardButton("승인 이모지", callback_data=f"emoji_edit:emoji_approval:{event_id}"),
-            InlineKeyboardButton("거절 이모지", callback_data=f"emoji_edit:emoji_rejection:{event_id}")
+            InlineKeyboardButton("승인", callback_data=f"emoji_edit:emoji_approval:{event_id}"),
+            InlineKeyboardButton("거절", callback_data=f"emoji_edit:emoji_rejection:{event_id}")
         ],
         [InlineKeyboardButton("모든 이모지 제거", callback_data=f"emoji:clear:{event_id}")],
         [InlineKeyboardButton("이벤트 관리", callback_data=f"event:manage:{event_id}")],
@@ -1361,11 +1386,14 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
 async def scheduler_loop(application: Application):
     await asyncio.sleep(2)
     logger.info("KST 자동 이벤트 스케줄러 시작")
+
     while True:
         try:
             now = now_dt()
             with db_connect() as conn:
-                rows = conn.execute("SELECT * FROM events WHERE status!='deleted' ORDER BY id ASC").fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM events WHERE status!='deleted' ORDER BY id ASC"
+                ).fetchall()
 
             for row in rows:
                 try:
@@ -1373,8 +1401,33 @@ async def scheduler_loop(application: Application):
                     if not event:
                         continue
 
+                    mode = int(event["manual_mode"] or 0)
                     start_at = parse_kst(event["start_at"])
                     end_at = parse_kst(event["deadline_at"])
+
+                    # 수동 OFF: 절대 자동 재시작하지 않음
+                    if mode == 2:
+                        continue
+
+                    # 수동 ON: 즉시 active 유지, 마감시간에는 자동 종료
+                    if mode == 1:
+                        if end_at and now >= end_at:
+                            if event["status"] != "ended":
+                                end_event(event["id"])
+                                event = get_event(event["id"])
+                            if event:
+                                await disable_start_notice_button(application, event)
+                            if event and not int(event["end_announced"] or 0):
+                                await send_group_notice(application, event["id"], "end", manual=False)
+                        else:
+                            if event["status"] != "active":
+                                start_event(event["id"], manual=False)
+                                event = get_event(event["id"])
+                            if event and not int(event["start_announced"] or 0):
+                                await send_group_notice(application, event["id"], "start", manual=False)
+                        continue
+
+                    # 예약자동
                     if not start_at or not end_at:
                         continue
 
@@ -1392,29 +1445,18 @@ async def scheduler_loop(application: Application):
                         if event["status"] != "active":
                             start_event(event["id"], manual=False)
                             event = get_event(event["id"])
-
                         if event and not int(event["start_announced"] or 0):
-                            ok, msg = await send_group_notice(application,event["id"],"start",manual=False)
-                            if ok:
-                                logger.info("자동 시작공지 완료 event_id=%s", event["id"])
-                            else:
-                                logger.warning("시작공지 재시도 예정 event_id=%s reason=%s", event["id"], msg)
+                            await send_group_notice(application, event["id"], "start", manual=False)
                         continue
 
                     if now >= end_at:
                         if event["status"] != "ended":
                             end_event(event["id"])
                             event = get_event(event["id"])
-
                         if event:
-                            await disable_start_notice_button(application,event)
-
+                            await disable_start_notice_button(application, event)
                         if event and not int(event["end_announced"] or 0):
-                            ok, msg = await send_group_notice(application,event["id"],"end",manual=False)
-                            if ok:
-                                logger.info("자동 종료공지 완료 event_id=%s", event["id"])
-                            else:
-                                logger.warning("종료공지 재시도 예정 event_id=%s reason=%s", event["id"], msg)
+                            await send_group_notice(application, event["id"], "end", manual=False)
 
                 except asyncio.CancelledError:
                     raise
@@ -1846,6 +1888,74 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+    if data.startswith("event_toggle:"):
+        _, action, event_id_text = data.split(":")
+        event_id = int(event_id_text)
+        event = get_event(event_id)
+
+        if not event:
+            await query.answer("이벤트를 찾을 수 없습니다.", show_alert=True)
+            return
+
+        if action == "on":
+            # 예약시간보다 일찍 즉시 시작 가능
+            set_event_field(event_id, "manual_mode", 1)
+            set_event_field(event_id, "start_announced", 0)
+            set_event_field(event_id, "end_announced", 0)
+            set_event_field(event_id, "start_notice_message_id", 0)
+            set_event_field(event_id, "start_notice_message_type", "")
+            set_event_field(event_id, "end_notice_message_id", 0)
+            set_event_field(event_id, "end_notice_message_type", "")
+            start_event(event_id, manual=False)
+
+            ok, msg = await send_group_notice(context.application, event_id, "start", manual=True)
+            event = get_event(event_id)
+
+            if ok:
+                await query.edit_message_text(
+                    event_card(event, admin=True) + "\n\n이벤트를 바로 시작했습니다.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=event_manage_keyboard(event),
+                )
+            else:
+                await query.edit_message_text(
+                    event_card(event, admin=True) +
+                    "\n\n이벤트는 시작됐지만 그룹 공지 전송에 실패했습니다.\n" +
+                    html.escape(msg),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=event_manage_keyboard(event),
+                )
+            return
+
+        if action == "off":
+            # 수동 종료 후 예약시간이 와도 자동 재시작하지 않음
+            set_event_field(event_id, "manual_mode", 2)
+            set_event_field(event_id, "end_announced", 0)
+            set_event_field(event_id, "end_notice_message_id", 0)
+            set_event_field(event_id, "end_notice_message_type", "")
+            end_event(event_id)
+
+            event = get_event(event_id)
+            await disable_start_notice_button(context.application, event)
+            ok, msg = await send_group_notice(context.application, event_id, "end", manual=True)
+            event = get_event(event_id)
+
+            if ok:
+                await query.edit_message_text(
+                    event_card(event, admin=True) + "\n\n이벤트를 종료했습니다.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=event_manage_keyboard(event),
+                )
+            else:
+                await query.edit_message_text(
+                    event_card(event, admin=True) +
+                    "\n\n이벤트는 종료됐지만 그룹 종료공지 전송에 실패했습니다.\n" +
+                    html.escape(msg),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=event_manage_keyboard(event),
+                )
+            return
+
     if data.startswith("event:"):
         _, action, event_id_text = data.split(":")
         event_id = int(event_id_text)
@@ -2176,6 +2286,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 if end and dt >= end:
                     await message.reply_text("시작시간은 마감시간보다 앞이어야 합니다."); return
                 set_event_field(event_id, "start_at", dt.strftime("%Y-%m-%d %H:%M"))
+                set_event_field(event_id, "manual_mode", 0)
                 set_event_field(event_id, "status", "scheduled" if dt > now_dt() else "active")
                 set_event_field(event_id, "pre_notice_announced", 0)
                 set_event_field(event_id, "start_announced", 0)
@@ -2185,6 +2296,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 if start and dt <= start:
                     await message.reply_text("마감시간은 시작시간보다 뒤여야 합니다."); return
                 set_event_field(event_id, "deadline_at", dt.strftime("%Y-%m-%d %H:%M"))
+                set_event_field(event_id, "manual_mode", 0)
                 set_event_field(event_id, "end_announced", 0)
         refresh_event_states_sync()
         context.user_data.clear()
@@ -2242,7 +2354,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V13 AUTO SCHEDULE FINAL 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V14 MANUAL ONOFF 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
