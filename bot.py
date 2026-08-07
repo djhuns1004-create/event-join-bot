@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V12.3 COMPACT UI
+# 신사 이벤트 참여봇 V12.5 STRICT TIME
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -54,7 +54,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v12_3_compact_ui")
+logger = logging.getLogger("sinsa_event_bot_v12_5_strict_time")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -568,14 +568,17 @@ def get_all_events() -> list[sqlite3.Row]:
 
 def get_active_events() -> list[sqlite3.Row]:
     """
-    회원에게는 실제 진행중(active) 이벤트만 표시합니다.
-    예약(scheduled) 이벤트는 시작시간 전까지 숨깁니다.
+    회원에게는 '현재 시간이 실제 이벤트 시간 범위 안'인 이벤트만 표시합니다.
+    status가 잘못 남아 있어도 시간 범위 밖이면 절대 노출하지 않습니다.
     """
     refresh_event_states_sync()
+
     with db_connect() as conn:
-        return conn.execute(
+        rows = conn.execute(
             "SELECT * FROM events WHERE status='active' ORDER BY id DESC"
         ).fetchall()
+
+    return [row for row in rows if event_time_window_open(row)]
 
 
 def create_event() -> int:
@@ -674,28 +677,100 @@ def delete_event(event_id: int) -> None:
         conn.commit()
 
 
-def refresh_event_states_sync() -> None:
-    """DB 상태만 갱신. 공지는 scheduler가 따로 발송합니다."""
+def event_time_window_open(event: sqlite3.Row) -> bool:
+    """설정된 시작/마감시간 범위 안에서만 True."""
     now = now_dt()
+    start = parse_kst(event["start_at"])
+    end = parse_kst(event["deadline_at"])
+
+    # 시작시간이나 마감시간 둘 중 하나라도 없으면 회원 참여 불가
+    if not start or not end:
+        return False
+
+    return start <= now < end
+
+
+def refresh_event_states_sync() -> None:
+    """
+    현재 KST 기준으로 이벤트 상태를 엄격하게 동기화합니다.
+    - 시작 전: scheduled
+    - 시작~마감 전: active
+    - 마감 도달/경과: ended
+    """
+    now = now_dt()
+
     with db_connect() as conn:
-        rows = conn.execute("SELECT id,status,start_at,deadline_at FROM events WHERE status!='deleted'").fetchall()
+        rows = conn.execute(
+            "SELECT id,status,start_at,deadline_at FROM events WHERE status!='deleted'"
+        ).fetchall()
+
         for row in rows:
             start = parse_kst(row["start_at"])
             end = parse_kst(row["deadline_at"])
-            status = row["status"]
-            if end and now > end and status not in {"ended", "deleted"}:
-                conn.execute("UPDATE events SET status='ended',ended_at=COALESCE(ended_at,?),updated_at=? WHERE id=?", (now_kst(), now_kst(), row["id"]))
-            elif start and now >= start and (not end or now <= end) and status in {"draft", "scheduled", "ended"}:
-                conn.execute("UPDATE events SET status='active',started_at=COALESCE(started_at,?),ended_at=NULL,updated_at=? WHERE id=?", (now_kst(), now_kst(), row["id"]))
-            elif start and now < start and status == "draft":
-                conn.execute("UPDATE events SET status='scheduled',updated_at=? WHERE id=?", (now_kst(), row["id"]))
+
+            # 시간이 완전히 설정되지 않은 이벤트는 회원에게 절대 공개하지 않음
+            if not start or not end:
+                if row["status"] not in {"draft", "deleted"}:
+                    conn.execute(
+                        "UPDATE events SET status='draft',updated_at=? WHERE id=?",
+                        (now_kst(), row["id"]),
+                    )
+                continue
+
+            if now < start:
+                new_status = "scheduled"
+            elif start <= now < end:
+                new_status = "active"
+            else:
+                new_status = "ended"
+
+            if row["status"] != new_status:
+                if new_status == "active":
+                    conn.execute(
+                        """
+                        UPDATE events
+                        SET status='active',
+                            started_at=COALESCE(started_at,?),
+                            ended_at=NULL,
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (now_kst(), now_kst(), row["id"]),
+                    )
+                elif new_status == "ended":
+                    conn.execute(
+                        """
+                        UPDATE events
+                        SET status='ended',
+                            ended_at=COALESCE(ended_at,?),
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (now_kst(), now_kst(), row["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE events
+                        SET status='scheduled',
+                            ended_at=NULL,
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (now_kst(), row["id"]),
+                    )
+
         conn.commit()
 
 
 def event_is_open(event: sqlite3.Row) -> bool:
     refresh_event_states_sync()
     fresh = get_event(event["id"])
-    return bool(fresh and fresh["status"] == "active")
+    return bool(
+        fresh
+        and fresh["status"] == "active"
+        and event_time_window_open(fresh)
+    )
 
 
 def event_title_html(event) -> str:
@@ -917,7 +992,6 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("이벤트 조건", callback_data=f"edit:conditions:{event['id']}")],
         [InlineKeyboardButton("대표 이미지/GIF", callback_data=f"media:set:{event['id']}")],
-        [InlineKeyboardButton("참여 인증 안내", callback_data=f"edit:proof_guide:{event['id']}")],
         [
             InlineKeyboardButton("승인 문구", callback_data=f"edit:approval:{event['id']}"),
             InlineKeyboardButton("거절 문구", callback_data=f"edit:rejection:{event['id']}")
@@ -957,7 +1031,6 @@ def emoji_manage_keyboard(event_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("시간 이모지", callback_data=f"emoji_edit:emoji_time:{event_id}"),
             InlineKeyboardButton("조건 이모지", callback_data=f"emoji_edit:emoji_conditions:{event_id}")
         ],
-        [InlineKeyboardButton("인증안내 이모지", callback_data=f"emoji_edit:emoji_proof:{event_id}")],
         [
             InlineKeyboardButton("승인 이모지", callback_data=f"emoji_edit:emoji_approval:{event_id}"),
             InlineKeyboardButton("거절 이모지", callback_data=f"emoji_edit:emoji_rejection:{event_id}")
@@ -1305,7 +1378,7 @@ async def scheduler_loop(application: Application):
 
                 # Railway 재시작 등으로 시작시간을 놓쳤어도,
                 # 아직 마감 전이면 이벤트 활성화 + 시작공지 복구
-                if start and now >= start and (not end or now < end):
+                if start and end and start <= now < end:
                     if event["status"] in {"draft", "scheduled"}:
                         start_event(event["id"], manual=False)
                         event = get_event(event["id"])
@@ -1386,7 +1459,7 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V12.3 COMPACT UI 정상 작동 중")
+    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V12.5 STRICT TIME 정상 작동 중")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1441,7 +1514,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     event = get_event(approw["event_id"])
     if not event or not event_is_open(event):
-        await message.reply_text("🔒 이벤트가 마감되어 더 이상 인증사진을 등록할 수 없습니다.")
+        await message.reply_text("현재 이벤트 참여 시간이 아닙니다. 시작시간 이후부터 마감시간 전까지만 신청할 수 있습니다.")
         return
     max_photos = 5
     added = add_application_photo(application_id, message.photo[-1].file_id, max_photos)
@@ -1594,7 +1667,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             event_id = int(parts[2])
             event = get_event(event_id)
             if not event or not event_is_open(event):
-                await query.message.reply_text(no_event_card(), parse_mode=ParseMode.HTML)
+                await query.message.reply_text("현재 이벤트 참여 시간이 아닙니다.\n\n설정된 시작시간 이후부터 마감시간 전까지만 참여할 수 있습니다.", parse_mode=ParseMode.HTML)
                 return
             existing = get_user_event_application(event_id, query.from_user.id)
             if existing and existing["status"] in {"collecting", "pending", "approved"}:
@@ -1603,10 +1676,11 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             application_id = create_application(event, query.from_user, "image")
             context.user_data["collecting_application_id"] = application_id
             await query.message.reply_text(
-                f"<b>{field_prefix(event,'emoji_proof')}이벤트 참여 인증</b>\n\n"
-                f"{proof_guide_html(event)}\n\n"
-                "인증 이미지는 <b>1장부터 최대 5장</b>까지 등록할 수 있습니다.\n"
-                "이미지를 모두 보낸 뒤 <b>인증 제출</b>을 눌러주세요.",
+                "<b>이벤트 참여 인증</b>\n\n"
+                f"<b>{field_prefix(event,'emoji_conditions')}이벤트 조건</b>\n"
+                f"{event_conditions_html(event)}\n\n"
+                "인증 이미지를 1~5장 등록해주세요.\n"
+                "이미지를 모두 보낸 뒤 인증 제출을 눌러주세요.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=submission_keyboard(application_id),
             )
@@ -1626,7 +1700,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             return
         event = get_event(approw["event_id"])
         if not event or not event_is_open(event):
-            await query.answer("이벤트가 마감되어 제출할 수 없습니다.", show_alert=True)
+            await query.answer("현재 이벤트 참여 시간이 아닙니다.", show_alert=True)
             return
         photos = get_application_photos(application_id)
         if not photos:
@@ -1782,7 +1856,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith("edit:"):
         _, field, event_id_text = data.split(":")
         event_id = int(event_id_text)
-        labels = {"title":"이벤트명", "content":"이벤트 내용", "participation_time":"이벤트 시간", "conditions":"이벤트 조건", "proof_guide":"참여 인증 안내", "pre_notice":"예고공지 문구", "start_notice":"시작공지 문구", "end_notice":"종료공지 문구", "approval":"승인 문구", "rejection":"거절 문구"}
+        labels = {"title":"이벤트명", "content":"이벤트 내용", "participation_time":"이벤트 시간", "conditions":"이벤트 조건", "pre_notice":"예고공지 문구", "start_notice":"시작공지 문구", "end_notice":"종료공지 문구", "approval":"승인 문구", "rejection":"거절 문구"}
         context.user_data.clear(); context.user_data["edit_event_id"] = event_id; context.user_data["edit_event_field"] = field
         extra = ""
         if field == "pre_notice":
@@ -2133,7 +2207,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V12.3 COMPACT UI 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V12.5 STRICT TIME 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
