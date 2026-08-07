@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V9.4
+# 신사 이벤트 참여봇 V9.5
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -52,7 +52,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v9_4")
+logger = logging.getLogger("sinsa_event_bot_v9_5")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -594,9 +594,44 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📚 전체 이벤트 관리", callback_data="admin:event_list")],
         [InlineKeyboardButton("📋 전체 승인 대기", callback_data="admin:pending"), InlineKeyboardButton("📊 전체 신청 현황", callback_data="admin:stats")],
         [InlineKeyboardButton("🔗 그룹/공지 설정", callback_data="admin:group")],
-        [InlineKeyboardButton("🎨 내 신청상태 버튼 이모지", callback_data="admin:status_emoji")],
+        [InlineKeyboardButton("✨ 이모지 설정", callback_data="admin:emoji")],
         [InlineKeyboardButton("❌ 관리자 메뉴 닫기", callback_data="admin:close")],
     ])
+
+
+
+def admin_emoji_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("이벤트 항목 이모지 설정", callback_data="emoji_admin:event_list")],
+        [InlineKeyboardButton("내 신청상태 버튼 이모지", callback_data="admin:status_emoji")],
+        [InlineKeyboardButton("⬅ 관리자 메뉴", callback_data="admin:home")],
+    ])
+
+
+def emoji_event_select_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for event in get_all_events()[:50]:
+        status_icon = {
+            "active": "🟢",
+            "scheduled": "⏰",
+            "draft": "⚪",
+            "ended": "🔴",
+        }.get(event["status"], "▫️")
+        rows.append([
+            InlineKeyboardButton(
+                f"{status_icon} #{event['id']} {(event['title'] or '')[:25]}",
+                callback_data=f"emoji_admin:event:{event['id']}",
+            )
+        ])
+    if not rows:
+        rows.append([
+            InlineKeyboardButton(
+                "등록된 이벤트가 없습니다",
+                callback_data="emoji_admin:none",
+            )
+        ])
+    rows.append([InlineKeyboardButton("⬅ 이모지 설정", callback_data="admin:emoji")])
+    return InlineKeyboardMarkup(rows)
 
 
 def admin_event_list_keyboard() -> InlineKeyboardMarkup:
@@ -650,6 +685,9 @@ def emoji_manage_keyboard(event_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("모든 이모지 제거", callback_data=f"emoji:clear:{event_id}")
+        ],
+        [
+            InlineKeyboardButton("⬅ 이모지 이벤트 목록", callback_data="emoji_admin:event_list")
         ],
         [
             InlineKeyboardButton("⬅ 이벤트 관리", callback_data=f"event:manage:{event_id}")
@@ -922,7 +960,7 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V9.4 정상 작동 중")
+    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V9.5 정상 작동 중")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1166,9 +1204,59 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "admin:stats":
         await send_stats(query.message)
         return
+    if data == "admin:emoji":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "<b>이모지 설정</b>\n\n"
+            "이벤트 카드 항목 이모지와 내 신청상태 버튼 이모지를 한 곳에서 관리할 수 있습니다.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_emoji_keyboard(),
+        )
+        return
+
+    if data.startswith("emoji_admin:"):
+        parts = data.split(":")
+        action = parts[1]
+
+        if action == "event_list":
+            await query.edit_message_text(
+                "<b>이벤트 항목 이모지 설정</b>\n\n"
+                "이모지를 설정할 이벤트를 선택해주세요.\n\n"
+                "설정 가능 항목\n"
+                "이벤트명 / 이벤트 내용 / 참가시간 / 자동 시작 / 참여 마감시간 / 참여조건 / 인증방식",
+                parse_mode=ParseMode.HTML,
+                reply_markup=emoji_event_select_keyboard(),
+            )
+            return
+
+        if action == "event":
+            event_id = int(parts[2])
+            event = get_event(event_id)
+            if not event:
+                await query.answer("이벤트를 찾을 수 없습니다.", show_alert=True)
+                return
+            await query.edit_message_text(
+                f"<b>{event_title_html(event)}</b>\n\n"
+                "설정할 항목을 선택한 뒤 일반 이모지 또는 텔레그램 프리미엄 이모지를 보내주세요.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=emoji_manage_keyboard(event_id),
+            )
+            return
+
+        if action == "none":
+            await query.answer("먼저 이벤트를 등록해주세요.", show_alert=True)
+            return
+
     if data == "admin:status_emoji":
-        context.user_data.clear(); context.user_data["edit_status_button_emoji"] = True
-        await query.edit_message_text("<b>내 신청 상태 버튼 이모지</b>\n\n일반 이모지 또는 프리미엄 이모지 하나를 보내주세요.\n제거하려면 <code>없음</code> 입력.", parse_mode=ParseMode.HTML, reply_markup=admin_home_keyboard())
+        context.user_data.clear()
+        context.user_data["edit_status_button_emoji"] = True
+        await query.edit_message_text(
+            "<b>내 신청 상태 버튼 이모지</b>\n\n"
+            "일반 이모지 또는 프리미엄 이모지 하나를 보내주세요.\n"
+            "제거하려면 <code>없음</code> 입력.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_emoji_keyboard(),
+        )
         return
     if data == "admin:group":
         title = get_setting("group_title", "미등록") or "미등록"
@@ -1446,7 +1534,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V9.4 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V9.5 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
