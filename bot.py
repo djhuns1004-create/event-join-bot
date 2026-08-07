@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V12.5 STRICT TIME
+# 신사 이벤트 참여봇 V13 AUTO SCHEDULE FINAL
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -54,7 +54,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v12_5_strict_time")
+logger = logging.getLogger("sinsa_event_bot_v13_auto_schedule_final")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -1359,58 +1359,83 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
 
 
 async def scheduler_loop(application: Application):
-    await asyncio.sleep(3)
-    logger.info("KST 이벤트 스케줄러 시작")
+    await asyncio.sleep(2)
+    logger.info("KST 자동 이벤트 스케줄러 시작")
     while True:
         try:
             now = now_dt()
             with db_connect() as conn:
-                rows = conn.execute("SELECT * FROM events WHERE status!='deleted'").fetchall()
+                rows = conn.execute("SELECT * FROM events WHERE status!='deleted' ORDER BY id ASC").fetchall()
 
             for row in rows:
-                event = get_event(row["id"])
-                if not event:
-                    continue
+                try:
+                    event = get_event(row["id"])
+                    if not event:
+                        continue
 
-                start = parse_kst(event["start_at"])
-                end = parse_kst(event["deadline_at"])
+                    start_at = parse_kst(event["start_at"])
+                    end_at = parse_kst(event["deadline_at"])
+                    if not start_at or not end_at:
+                        continue
 
+                    if now < start_at:
+                        if event["status"] != "scheduled":
+                            with db_connect() as conn:
+                                conn.execute(
+                                    "UPDATE events SET status='scheduled',ended_at=NULL,updated_at=? WHERE id=?",
+                                    (now_kst(), event["id"]),
+                                )
+                                conn.commit()
+                        continue
 
-                # Railway 재시작 등으로 시작시간을 놓쳤어도,
-                # 아직 마감 전이면 이벤트 활성화 + 시작공지 복구
-                if start and end and start <= now < end:
-                    if event["status"] in {"draft", "scheduled"}:
-                        start_event(event["id"], manual=False)
-                        event = get_event(event["id"])
+                    if start_at <= now < end_at:
+                        if event["status"] != "active":
+                            start_event(event["id"], manual=False)
+                            event = get_event(event["id"])
 
-                    if event and not event["start_announced"]:
-                        await send_group_notice(application, event["id"], "start", manual=False)
+                        if event and not int(event["start_announced"] or 0):
+                            ok, msg = await send_group_notice(application,event["id"],"start",manual=False)
+                            if ok:
+                                logger.info("자동 시작공지 완료 event_id=%s", event["id"])
+                            else:
+                                logger.warning("시작공지 재시도 예정 event_id=%s reason=%s", event["id"], msg)
+                        continue
 
-                # 마감시간 도달 시 무조건 자동 종료
-                if end and now >= end:
-                    event = get_event(event["id"])
-                    if event and event["status"] != "ended":
-                        end_event(event["id"])
-                        event = get_event(event["id"])
+                    if now >= end_at:
+                        if event["status"] != "ended":
+                            end_event(event["id"])
+                            event = get_event(event["id"])
 
-                    # 시작공지 참여버튼 즉시 제거
-                    if event:
-                        await disable_start_notice_button(application, event)
+                        if event:
+                            await disable_start_notice_button(application,event)
 
-                    # Railway 재시작 후 마감공지를 놓친 경우에도 복구
-                    if event and not event["end_announced"]:
-                        await send_group_notice(application, event["id"], "end", manual=False)
+                        if event and not int(event["end_announced"] or 0):
+                            ok, msg = await send_group_notice(application,event["id"],"end",manual=False)
+                            if ok:
+                                logger.info("자동 종료공지 완료 event_id=%s", event["id"])
+                            else:
+                                logger.warning("종료공지 재시도 예정 event_id=%s reason=%s", event["id"], msg)
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("개별 이벤트 자동 처리 실패 event_id=%s", row["id"])
 
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("스케줄러 오류")
+            logger.exception("자동 이벤트 스케줄러 전체 오류")
 
-        await asyncio.sleep(20)
+        await asyncio.sleep(5)
 
 
 async def post_init(application: Application) -> None:
+    try:
+        refresh_event_states_sync()
+    except Exception:
+        logger.exception("시작 시 이벤트 상태 동기화 실패")
     application.create_task(scheduler_loop(application), name="event_scheduler")
+    logger.info("자동 이벤트 스케줄러 태스크 등록 완료")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1459,7 +1484,9 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V12.5 STRICT TIME 정상 작동 중")
+    await update.effective_message.reply_text(
+        "신사 이벤트 참여봇 V13 정상 작동 중\n자동 스케줄러: KST 기준 5초 간격 확인"
+    )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2148,13 +2175,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 end = parse_kst(get_event(event_id)["deadline_at"])
                 if end and dt >= end:
                     await message.reply_text("시작시간은 마감시간보다 앞이어야 합니다."); return
-                set_event_field(event_id, "start_at", dt.strftime("%Y-%m-%d %H:%M")); set_event_field(event_id, "status", "scheduled" if dt > now_dt() else "active"); set_event_field(event_id, "pre_notice_announced", 0); set_event_field(event_id, "start_announced", 0)
+                set_event_field(event_id, "start_at", dt.strftime("%Y-%m-%d %H:%M"))
+                set_event_field(event_id, "status", "scheduled" if dt > now_dt() else "active")
+                set_event_field(event_id, "pre_notice_announced", 0)
+                set_event_field(event_id, "start_announced", 0)
+                set_event_field(event_id, "end_announced", 0)
             else:
                 start = parse_kst(get_event(event_id)["start_at"])
                 if start and dt <= start:
                     await message.reply_text("마감시간은 시작시간보다 뒤여야 합니다."); return
-                set_event_field(event_id, "deadline_at", dt.strftime("%Y-%m-%d %H:%M")); set_event_field(event_id, "end_announced", 0)
-        context.user_data.clear(); await message.reply_text("시간을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id))); return
+                set_event_field(event_id, "deadline_at", dt.strftime("%Y-%m-%d %H:%M"))
+                set_event_field(event_id, "end_announced", 0)
+        refresh_event_states_sync()
+        context.user_data.clear()
+        await message.reply_text("시간을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id)))
+        return
 
     emoji_event_id = context.user_data.get("edit_emoji_event_id")
     emoji_field = context.user_data.get("edit_emoji_field")
@@ -2207,7 +2242,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V12.5 STRICT TIME 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V13 AUTO SCHEDULE FINAL 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
