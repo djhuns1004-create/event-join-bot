@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V10
+# 신사 이벤트 참여봇 V11.1 SIMPLE
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -54,7 +54,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("sinsa_event_bot_v10")
+logger = logging.getLogger("sinsa_event_bot_v11_1_simple")
 
 STATUS_TEXT = {
     "collecting": "📸 인증사진 등록 중",
@@ -292,6 +292,20 @@ def init_db() -> None:
         """)
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS event_media_v11 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                media_type TEXT NOT NULL DEFAULT 'photo',
+                created_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_event_media_v11_event
+            ON event_media_v11(event_id, id)
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS settings_v8 (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
@@ -310,6 +324,25 @@ def init_db() -> None:
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO settings_v8(key,value) VALUES (?,?)", (k, v))
+
+        # V11.1: 기존 단일 대표미디어 자동 이전
+        try:
+            for legacy in conn.execute("""
+                SELECT id, media_file_id, media_type
+                FROM events
+                WHERE media_file_id IS NOT NULL AND media_file_id != ''
+            """).fetchall():
+                exists = conn.execute(
+                    "SELECT 1 FROM event_media_v11 WHERE event_id=? LIMIT 1",
+                    (legacy["id"],),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        "INSERT INTO event_media_v11(event_id,file_id,media_type,created_at) VALUES(?,?,?,?)",
+                        (legacy["id"], legacy["media_file_id"], legacy["media_type"] or "photo", now_kst()),
+                    )
+        except Exception:
+            logger.exception("기존 대표미디어 자동 이전 실패")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_v9_event_user ON applications_v6(event_id,user_id,id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_v9_status ON applications_v6(status,id DESC)")
@@ -402,6 +435,50 @@ def parse_kst(value: str) -> Optional[datetime]:
 def fmt_kst(value: str, empty="미설정") -> str:
     dt = parse_kst(value)
     return dt.strftime("%Y.%m.%d %H:%M") if dt else empty
+
+
+def get_event_media(event_id: int) -> list[sqlite3.Row]:
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT id,event_id,file_id,media_type,created_at FROM event_media_v11 WHERE event_id=? ORDER BY id ASC LIMIT 5",
+            (event_id,),
+        ).fetchall()
+
+
+def event_media_count(event_id: int) -> int:
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS count FROM event_media_v11 WHERE event_id=?",
+            (event_id,),
+        ).fetchone()["count"]
+
+
+def add_event_media(event_id: int, file_id: str, media_type: str) -> bool:
+    if media_type not in {"photo", "animation"}:
+        return False
+    with db_connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) AS count FROM event_media_v11 WHERE event_id=?",
+            (event_id,),
+        ).fetchone()["count"]
+        if count >= 5:
+            return False
+        conn.execute(
+            "INSERT INTO event_media_v11(event_id,file_id,media_type,created_at) VALUES(?,?,?,?)",
+            (event_id, file_id, media_type, now_kst()),
+        )
+        conn.commit()
+    return True
+
+
+def clear_event_media(event_id: int) -> None:
+    with db_connect() as conn:
+        conn.execute("DELETE FROM event_media_v11 WHERE event_id=?", (event_id,))
+        conn.execute(
+            "UPDATE events SET media_file_id='',media_type='',updated_at=? WHERE id=?",
+            (now_kst(), event_id),
+        )
+        conn.commit()
 
 
 def get_event(event_id: int) -> Optional[sqlite3.Row]:
@@ -587,33 +664,34 @@ def proof_guide_html(event: sqlite3.Row) -> str:
 
 
 def event_card(event: sqlite3.Row, admin: bool = False) -> str:
-    status = {"draft": "등록 대기", "scheduled": "예약", "active": "신청 가능", "ended": "종료"}.get(event["status"], event["status"])
-    start_text = fmt_kst(event["start_at"], "수동 시작")
-    deadline_text = fmt_kst(event["deadline_at"], "별도 마감시간 없음")
+    deadline_text = event["deadline_at"] or "별도 마감시간 없음"
+    start_text = event["start_at"] or "수동 시작"
+
     text = (
-        f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n\n"
+        f"<b>{field_prefix(event, 'emoji_title')}{event_title_html(event)}</b>\n\n"
         f"{CARD_LINE}\n\n"
-        f"<b>{field_prefix(event,'emoji_content')}이벤트 내용</b>\n{event_content_html(event)}\n\n"
-        f"<b>{field_prefix(event,'emoji_time')}참가시간</b>\n{event_time_html(event)}\n\n"
-        f"<b>{field_prefix(event,'emoji_start')}자동 시작</b>\n{html.escape(start_text)}\n\n"
-        f"<b>{field_prefix(event,'emoji_deadline')}참여 마감시간</b>\n{html.escape(deadline_text)}\n\n"
-        f"<b>{field_prefix(event,'emoji_conditions')}참여조건</b>\n{event_conditions_html(event)}\n\n"
-        f"<b>{field_prefix(event,'emoji_proof')}인증안내</b>\n{proof_guide_html(event)}\n\n"
+        f"<b>{field_prefix(event, 'emoji_content')}이벤트 내용</b>\n"
+        f"{event_content_html(event)}\n\n"
+        f"<b>{field_prefix(event, 'emoji_time')}이벤트 시간</b>\n"
+        f"{html.escape(start_text)} ~ {html.escape(deadline_text)}\n\n"
+        f"<b>{field_prefix(event, 'emoji_conditions')}이벤트 조건</b>\n"
+        f"{event_conditions_html(event)}\n\n"
         f"{CARD_LINE}"
     )
+
     if admin:
+        status = {
+            "draft": "등록 대기",
+            "scheduled": "예약",
+            "active": "진행중",
+            "ended": "종료",
+        }.get(event["status"], event["status"])
         text += (
-            f"\n\n<b>상태</b> : {status}"
-            f"\n<b>이벤트 번호</b> : <code>#{event['id']}</code>"
-            f"\n<b>인증사진</b> : 1~5장"
-            f"\n<b>10분전 예고</b> : {'ON' if event['pre_notice_enabled'] else 'OFF'}"
-            f"\n<b>시작공지</b> : {'ON' if event['announce_start'] else 'OFF'}"
-            f"\n<b>마감공지</b> : {'ON' if event['announce_end'] else 'OFF'}"
-            f"\n<b>시작공지 고정</b> : {'ON' if event['pin_start_notice'] else 'OFF'}"
-            f"\n<b>마감공지 고정</b> : {'ON' if event['pin_end_notice'] else 'OFF'}"
-            f"\n<b>이벤트 대표미디어</b> : {event['media_type'] or '없음'}"
-            f"\n<b>예고/시작/마감 미디어</b> : {event['pre_media_type'] or '-'} / {event['start_media_type'] or '-'} / {event['end_media_type'] or '-'}"
+            f"\n\n상태 : {status}\n"
+            f"대표 이미지/GIF : {event_media_count(event['id'])}/5개\n"
+            f"이벤트 번호 : <code>#{event['id']}</code>"
         )
+
     return text
 
 
@@ -655,6 +733,14 @@ def proof_keyboard(event_id: int, mode: str) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("🤝 당일 제휴 이용 인증", callback_data=f"proof:partner:{event_id}")])
     rows.append([InlineKeyboardButton("⬅ 이벤트로 돌아가기", callback_data=f"user:event:{event_id}")])
     return InlineKeyboardMarkup(rows)
+
+
+def event_media_manage_keyboard(event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("등록 완료", callback_data=f"media:done:{event_id}")],
+        [InlineKeyboardButton("대표 이미지/GIF 전체 삭제", callback_data=f"media:clear:{event_id}")],
+        [InlineKeyboardButton("이벤트 관리", callback_data=f"event:manage:{event_id}")],
+    ])
 
 
 def submission_keyboard(application_id: int) -> InlineKeyboardMarkup:
@@ -738,64 +824,64 @@ def admin_event_list_keyboard() -> InlineKeyboardMarkup:
 
 def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("이벤트명 수정", callback_data=f"edit:title:{event['id']}"), InlineKeyboardButton("내용 수정", callback_data=f"edit:content:{event['id']}")],
-        [InlineKeyboardButton("참가시간 문구", callback_data=f"edit:participation_time:{event['id']}"), InlineKeyboardButton("참여조건 수정", callback_data=f"edit:conditions:{event['id']}")],
-        [InlineKeyboardButton("시작시간 설정", callback_data=f"schedule:start:{event['id']}"), InlineKeyboardButton("마감시간 설정", callback_data=f"schedule:end:{event['id']}")],
-        [InlineKeyboardButton("인증안내 수정", callback_data=f"edit:proof_guide:{event['id']}"), InlineKeyboardButton("이벤트 대표 이미지/GIF", callback_data=f"media:set:{event['id']}")],
-
-        [InlineKeyboardButton("10분전 예고문구 수정", callback_data=f"edit:pre_notice:{event['id']}")],
-        [InlineKeyboardButton("시작공지 문구 수정", callback_data=f"edit:start_notice:{event['id']}"), InlineKeyboardButton("마감공지 문구 수정", callback_data=f"edit:end_notice:{event['id']}")],
-
-        [InlineKeyboardButton("예고공지 이미지/GIF", callback_data=f"notice_media:pre:{event['id']}")],
-        [InlineKeyboardButton("시작공지 이미지/GIF", callback_data=f"notice_media:start:{event['id']}"), InlineKeyboardButton("마감공지 이미지/GIF", callback_data=f"notice_media:end:{event['id']}")],
-
-        [InlineKeyboardButton(f"10분전 예고 {'ON' if event['pre_notice_enabled'] else 'OFF'}", callback_data=f"toggle:pre_notice:{event['id']}")],
-        [InlineKeyboardButton(f"시작공지 {'ON' if event['announce_start'] else 'OFF'}", callback_data=f"toggle:start_notice:{event['id']}"), InlineKeyboardButton(f"마감공지 {'ON' if event['announce_end'] else 'OFF'}", callback_data=f"toggle:end_notice:{event['id']}")],
-        [InlineKeyboardButton(f"시작공지 고정 {'ON' if event['pin_start_notice'] else 'OFF'}", callback_data=f"toggle:pin_start:{event['id']}"), InlineKeyboardButton(f"마감공지 고정 {'ON' if event['pin_end_notice'] else 'OFF'}", callback_data=f"toggle:pin_end:{event['id']}")],
-
-        [InlineKeyboardButton("그룹 예고공지 반영", callback_data=f"announce:pre:{event['id']}")],
-        [InlineKeyboardButton("그룹 시작공지 반영", callback_data=f"announce:start:{event['id']}"), InlineKeyboardButton("그룹 마감공지 반영", callback_data=f"announce:end:{event['id']}")],
-
-        [InlineKeyboardButton("승인문구", callback_data=f"edit:approval:{event['id']}"), InlineKeyboardButton("거절문구", callback_data=f"edit:rejection:{event['id']}")],
-        [InlineKeyboardButton("이모지 설정", callback_data=f"emoji:menu:{event['id']}")],
-        [InlineKeyboardButton("미리보기", callback_data=f"event:preview:{event['id']}")],
-        [InlineKeyboardButton("이 이벤트 승인 대기", callback_data=f"event:pending:{event['id']}"), InlineKeyboardButton("이 이벤트 현황", callback_data=f"event:stats:{event['id']}")],
+        [
+            InlineKeyboardButton("이벤트명 수정", callback_data=f"edit:title:{event['id']}"),
+            InlineKeyboardButton("내용 수정", callback_data=f"edit:content:{event['id']}")
+        ],
+        [
+            InlineKeyboardButton("이벤트 시간 설정", callback_data=f"schedule:start:{event['id']}"),
+            InlineKeyboardButton("마감시간 설정", callback_data=f"schedule:end:{event['id']}")
+        ],
+        [
+            InlineKeyboardButton("이벤트 조건 수정", callback_data=f"edit:conditions:{event['id']}")
+        ],
+        [
+            InlineKeyboardButton("대표 이미지/GIF", callback_data=f"media:set:{event['id']}")
+        ],
+        [
+            InlineKeyboardButton("공지 시작문구 수정", callback_data=f"edit:start_notice:{event['id']}"),
+            InlineKeyboardButton("공지 종료문구 수정", callback_data=f"edit:end_notice:{event['id']}")
+        ],
+        [
+            InlineKeyboardButton("이모지 설정", callback_data=f"emoji:menu:{event['id']}")
+        ],
+        [
+            InlineKeyboardButton("미리보기", callback_data=f"event:preview:{event['id']}")
+        ],
+        [
+            InlineKeyboardButton("승인 대기", callback_data=f"event:pending:{event['id']}"),
+            InlineKeyboardButton("이벤트 현황", callback_data=f"event:stats:{event['id']}")
+        ],
     ]
+
     if event["status"] == "active":
-        rows.append([InlineKeyboardButton("지금 이벤트 종료", callback_data=f"event:end:{event['id']}")])
+        rows.append([InlineKeyboardButton("이벤트 종료", callback_data=f"event:end:{event['id']}")])
     else:
-        rows.append([InlineKeyboardButton("지금 이벤트 시작", callback_data=f"event:start:{event['id']}")])
+        rows.append([InlineKeyboardButton("이벤트 시작", callback_data=f"event:start:{event['id']}")])
+
     if event["status"] != "active":
         rows.append([InlineKeyboardButton("이벤트 삭제", callback_data=f"event:delete_confirm:{event['id']}")])
-    rows += [[InlineKeyboardButton("전체 이벤트", callback_data="admin:event_list")], [InlineKeyboardButton("관리자 메뉴", callback_data="admin:home")]]
+
+    rows.append([InlineKeyboardButton("전체 이벤트", callback_data="admin:event_list")])
+    rows.append([InlineKeyboardButton("관리자 메뉴", callback_data="admin:home")])
     return InlineKeyboardMarkup(rows)
 
 
 def emoji_manage_keyboard(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("제목 이모지", callback_data=f"emoji_edit:emoji_title:{event_id}"),
+            InlineKeyboardButton("이벤트명 이모지", callback_data=f"emoji_edit:emoji_title:{event_id}"),
             InlineKeyboardButton("내용 이모지", callback_data=f"emoji_edit:emoji_content:{event_id}")
         ],
         [
-            InlineKeyboardButton("참가시간 이모지", callback_data=f"emoji_edit:emoji_time:{event_id}"),
-            InlineKeyboardButton("자동 시작 이모지", callback_data=f"emoji_edit:emoji_start:{event_id}")
-        ],
-        [
-            InlineKeyboardButton("마감시간 이모지", callback_data=f"emoji_edit:emoji_deadline:{event_id}"),
-            InlineKeyboardButton("참여조건 이모지", callback_data=f"emoji_edit:emoji_conditions:{event_id}")
-        ],
-        [
-            InlineKeyboardButton("인증안내 이모지", callback_data=f"emoji_edit:emoji_proof:{event_id}")
+            InlineKeyboardButton("시간 이모지", callback_data=f"emoji_edit:emoji_time:{event_id}"),
+            InlineKeyboardButton("조건 이모지", callback_data=f"emoji_edit:emoji_conditions:{event_id}")
         ],
         [
             InlineKeyboardButton("모든 이모지 제거", callback_data=f"emoji:clear:{event_id}")
         ],
         [
-            InlineKeyboardButton("⬅ 이모지 이벤트 목록", callback_data="emoji_admin:event_list")
-        ],
-        [
-            InlineKeyboardButton("⬅ 이벤트 관리", callback_data=f"event:manage:{event_id}")
+            InlineKeyboardButton("이벤트 관리", callback_data=f"event:manage:{event_id}")
         ],
     ])
 
@@ -889,20 +975,28 @@ def status_card(row: Optional[sqlite3.Row]) -> str:
     )
 
 
+async def send_event_media(bot, chat_id: int, event_id: int) -> int:
+    sent = 0
+    for item in get_event_media(event_id)[:5]:
+        try:
+            if item["media_type"] == "animation":
+                await bot.send_animation(chat_id, animation=item["file_id"])
+            else:
+                await bot.send_photo(chat_id, photo=item["file_id"])
+            sent += 1
+        except Exception:
+            logger.exception("대표미디어 전송 실패 event_id=%s media_id=%s", event_id, item["id"])
+    return sent
+
+
 async def send_event_card(bot, chat_id: int, event: sqlite3.Row, reply_markup=None, admin=False):
-    text = event_card(event, admin=admin)
-    file_id = event["media_file_id"] or ""
-    mtype = event["media_type"] or ""
-    try:
-        if file_id and mtype == "animation":
-            await bot.send_animation(chat_id, animation=file_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-        elif file_id and mtype == "photo":
-            await bot.send_photo(chat_id, photo=file_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-        else:
-            await bot.send_message(chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-    except BadRequest as e:
-        logger.warning("미디어 카드 실패, 텍스트로 대체: %s", e)
-        await bot.send_message(chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    await send_event_media(bot, chat_id, event["id"])
+    await bot.send_message(
+        chat_id,
+        text=event_card(event, admin=admin),
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup,
+    )
 
 
 async def bot_deep_link(application: Application, event_id: int) -> str:
@@ -914,49 +1008,46 @@ async def bot_deep_link(application: Application, event_id: int) -> str:
 
 
 def render_event_notice(event: sqlite3.Row, kind: str) -> str:
-    if kind == "pre":
-        template = event["pre_notice_html"] or ""
-        if not template:
-            template = (
-                "<b>EVENT SOON</b>\n\n"
-                "{title}\n\n"
-                "이벤트 시작 10분 전입니다.\n"
-                "시작시간 : {start_at}\n"
-                "마감시간 : {deadline_at}"
-            )
-    elif kind == "start":
+    if kind == "start":
         template = event["start_notice_html"] or ""
-        if not template:
-            template = (
-                "<b>EVENT OPEN</b>\n\n"
-                "{title}\n\n"
-                "{content}\n\n"
-                "<b>참여기간</b>\n{start_at} ~ {deadline_at}\n\n"
-                "<b>참여조건</b>\n{conditions}\n\n"
-                "<b>인증안내</b>\n{proof_guide}\n\n"
-                "아래 버튼을 눌러 이벤트에 참여해주세요."
-            )
-    else:
-        template = event["end_notice_html"] or ""
-        if not template:
-            template = (
-                "<b>EVENT CLOSED</b>\n\n"
-                "{title} 참여가 마감되었습니다.\n\n"
-                "접수된 신청은 관리자 확인 후 순차적으로 처리됩니다."
-            )
+        if template:
+            replacements = {
+                "{title}": f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>",
+                "{content}": event_content_html(event),
+                "{start_at}": html.escape(fmt_kst(event["start_at"], "지금부터")),
+                "{deadline_at}": html.escape(fmt_kst(event["deadline_at"], "별도 마감 없음")),
+                "{conditions}": event_conditions_html(event),
+            }
+            rendered = template
+            for key, value in replacements.items():
+                rendered = rendered.replace(key, value)
+            return rendered
 
-    replacements = {
-        "{title}": f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>",
-        "{content}": event_content_html(event),
-        "{start_at}": html.escape(fmt_kst(event["start_at"], "지금부터")),
-        "{deadline_at}": html.escape(fmt_kst(event["deadline_at"], "별도 마감 없음")),
-        "{conditions}": event_conditions_html(event),
-        "{proof_guide}": proof_guide_html(event),
-    }
-    rendered = template
-    for key, value in replacements.items():
-        rendered = rendered.replace(key, value)
-    return rendered
+        return (
+            f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n\n"
+            f"{CARD_LINE}\n\n"
+            f"<b>{field_prefix(event,'emoji_content')}이벤트 내용</b>\n"
+            f"{event_content_html(event)}\n\n"
+            f"<b>{field_prefix(event,'emoji_time')}이벤트 시간</b>\n"
+            f"{html.escape(fmt_kst(event['start_at'], '지금부터'))} ~ "
+            f"{html.escape(fmt_kst(event['deadline_at'], '별도 마감 없음'))}\n\n"
+            f"<b>{field_prefix(event,'emoji_conditions')}이벤트 조건</b>\n"
+            f"{event_conditions_html(event)}\n\n"
+            f"{CARD_LINE}"
+        )
+
+    template = event["end_notice_html"] or ""
+    if template:
+        rendered = template.replace(
+            "{title}",
+            f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>"
+        )
+        return rendered
+
+    return (
+        f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n\n"
+        "이벤트가 종료되었습니다."
+    )
 
 
 async def _edit_or_send_notice(application: Application, group_id: int, event: sqlite3.Row, kind: str, text: str, markup):
@@ -1080,13 +1171,7 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
     if not event:
         return False, "이벤트를 찾을 수 없습니다."
 
-    if kind == "pre":
-        if not manual and not event["pre_notice_enabled"]:
-            return True, "10분전 예고 OFF"
-        text = render_event_notice(event, "pre")
-        markup = None
-
-    elif kind == "start":
+    if kind == "start":
         if not manual and (not event["announce_start"] or get_setting("group_start_notice_enabled", "1") != "1"):
             return True, "시작 공지 OFF"
         text = render_event_notice(event, "start")
@@ -1100,6 +1185,8 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
         markup = None
 
     try:
+        if kind == "start" and not int(event["start_notice_message_id"] or 0):
+            await send_event_media(application.bot, int(group_id), event_id)
         message_id = await _edit_or_send_notice(application, int(group_id), event, kind, text, markup)
     except Exception as exc:
         logger.exception("그룹 공지 처리 실패 kind=%s event_id=%s", kind, event_id)
@@ -1143,11 +1230,6 @@ async def scheduler_loop(application: Application):
                 start = parse_kst(event["start_at"])
                 end = parse_kst(event["deadline_at"])
 
-                # 시작 10분 전 예고
-                if start and event["pre_notice_enabled"] and not event["pre_notice_announced"]:
-                    pre_at = start - timedelta(minutes=10)
-                    if pre_at <= now < start:
-                        await send_group_notice(application, event["id"], "pre", manual=False)
 
                 # Railway 재시작 등으로 시작시간을 놓쳤어도,
                 # 아직 마감 전이면 이벤트 활성화 + 시작공지 복구
@@ -1234,7 +1316,7 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V10 정상 작동 중")
+    await update.effective_message.reply_text("✅ 신사 이벤트 참여봇 V11.1 SIMPLE 정상 작동 중")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1257,14 +1339,22 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("공지용 이미지를 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id)))
         return
 
-    # 관리자 이벤트 대표 사진 등록 상태
+    # 관리자 이벤트 대표 이미지 등록: 사진/GIF 합계 최대 5개
     if is_admin(user.id) and context.user_data.get("media_event_id"):
         event_id = context.user_data["media_event_id"]
-        set_event_field(event_id, "media_file_id", message.photo[-1].file_id)
-        set_event_field(event_id, "media_type", "photo")
-        context.user_data.clear()
-        event = get_event(event_id)
-        await message.reply_text("✅ 이벤트 대표 이미지를 저장했습니다.", reply_markup=event_manage_keyboard(event))
+        added = add_event_media(event_id, message.photo[-1].file_id, "photo")
+        count = event_media_count(event_id)
+        if not added:
+            await message.reply_text(
+                "대표 이미지/GIF는 최대 5개까지 등록할 수 있습니다.",
+                reply_markup=event_media_manage_keyboard(event_id),
+            )
+            return
+        await message.reply_text(
+            f"대표 이미지가 등록되었습니다.\n\n현재 등록: {count}/5개\n"
+            "사진이나 GIF를 더 보내거나 등록 완료를 눌러주세요.",
+            reply_markup=event_media_manage_keyboard(event_id),
+        )
         return
 
     application_id = context.user_data.get("collecting_application_id")
@@ -1310,10 +1400,19 @@ async def animation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     event_id = context.user_data.get("media_event_id")
     if not event_id:
         return
-    set_event_field(event_id, "media_file_id", update.effective_message.animation.file_id)
-    set_event_field(event_id, "media_type", "animation")
-    context.user_data.clear()
-    await update.effective_message.reply_text("✅ 이벤트 대표 GIF를 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id)))
+    added = add_event_media(event_id, update.effective_message.animation.file_id, "animation")
+    count = event_media_count(event_id)
+    if not added:
+        await update.effective_message.reply_text(
+            "대표 이미지/GIF는 최대 5개까지 등록할 수 있습니다.",
+            reply_markup=event_media_manage_keyboard(event_id),
+        )
+        return
+    await update.effective_message.reply_text(
+        f"대표 GIF가 등록되었습니다.\n\n현재 등록: {count}/5개\n"
+        "사진이나 GIF를 더 보내거나 등록 완료를 눌러주세요.",
+        reply_markup=event_media_manage_keyboard(event_id),
+    )
 
 
 async def send_application_to_admin(context: ContextTypes.DEFAULT_TYPE, application: sqlite3.Row, photos: list[str]) -> None:
@@ -1634,12 +1733,40 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith("media:"):
         _, action, event_id_text = data.split(":")
         event_id = int(event_id_text)
+
         if action == "set":
-            context.user_data.clear(); context.user_data["media_event_id"] = event_id
-            await query.edit_message_text("🖼 대표 사진 또는 GIF를 보내주세요.\n\n제거하려면 아래 버튼을 누르세요.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 대표미디어 제거", callback_data=f"media:clear:{event_id}")],[InlineKeyboardButton("⬅ 이벤트 관리", callback_data=f"event:manage:{event_id}")]])); return
+            context.user_data.clear()
+            context.user_data["media_event_id"] = event_id
+            count = event_media_count(event_id)
+            await query.edit_message_text(
+                f"<b>대표 이미지/GIF 설정</b>\n\n"
+                f"현재 등록: {count}/5개\n\n"
+                "사진 또는 GIF를 보내주세요.\n"
+                "사진과 GIF를 섞어서 최대 5개까지 등록할 수 있습니다.\n"
+                "등록이 끝나면 등록 완료를 눌러주세요.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=event_media_manage_keyboard(event_id),
+            )
+            return
+
+        if action == "done":
+            context.user_data.clear()
+            await query.edit_message_text(
+                f"대표 이미지/GIF 설정 완료\n\n현재 등록: {event_media_count(event_id)}/5개",
+                reply_markup=event_manage_keyboard(get_event(event_id)),
+            )
+            return
+
         if action == "clear":
-            set_event_field(event_id,"media_file_id",""); set_event_field(event_id,"media_type","")
-            context.user_data.clear(); await query.edit_message_text("✅ 대표미디어를 제거했습니다.", reply_markup=event_manage_keyboard(get_event(event_id))); return
+            clear_event_media(event_id)
+            context.user_data.clear()
+            context.user_data["media_event_id"] = event_id
+            await query.edit_message_text(
+                "대표 이미지/GIF를 모두 삭제했습니다.\n\n"
+                "새 사진 또는 GIF를 보내거나 등록 완료를 눌러주세요.",
+                reply_markup=event_media_manage_keyboard(event_id),
+            )
+            return
 
     if data.startswith("notice_media:"):
         _, kind, event_id_text = data.split(":")
@@ -1869,7 +1996,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V10 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V11.1 SIMPLE 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
