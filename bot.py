@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V16.3 KST BUNDLED NOTICE
+# 신사 이벤트 참여봇 V16.4 THREE STAGE NOTICE
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -1233,7 +1233,7 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
         and event_time_window_open(event)
     )
     rows = [
-        [InlineKeyboardButton("이벤트 등록하기", callback_data=f"event_register:{event['id']}")],
+        [InlineKeyboardButton("이벤트 등록 완료", callback_data=f"event_register:{event['id']}")],
         [InlineKeyboardButton("ON", callback_data=f"event_toggle:on:{event['id']}"), InlineKeyboardButton("OFF", callback_data=f"event_toggle:off:{event['id']}")],
         [InlineKeyboardButton("이벤트명", callback_data=f"edit:title:{event['id']}"), InlineKeyboardButton("이벤트 내용", callback_data=f"edit:content:{event['id']}")],
         [InlineKeyboardButton("시작시간", callback_data=f"schedule:start:{event['id']}"), InlineKeyboardButton("마감시간", callback_data=f"schedule:end:{event['id']}")],
@@ -1440,7 +1440,8 @@ def render_event_notice(event: sqlite3.Row, kind: str) -> str:
 
     return (
         f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n\n"
-        "이벤트가 종료되었습니다."
+        "이벤트가 종료되었습니다.\n"
+        "더 이상 참여할 수 없습니다."
     )
 
 
@@ -1565,28 +1566,63 @@ async def disable_start_notice_button(application: Application, event: sqlite3.R
 
 
 async def send_registration_notice(application: Application, event_id: int) -> tuple[bool, str]:
+    """
+    이벤트 등록 완료 직후 그룹에 등록 안내를 전송합니다.
+    대표 이미지/GIF 첫 장 + 이벤트 내용 + 이벤트 시간 + 조건을
+    하나의 메시지로 묶어서 전송합니다.
+    """
     event = get_event(event_id)
     if not event:
         return False, "이벤트를 찾을 수 없습니다."
-    group_id = get_setting("group_id", "")
+
+    group_id = get_setting("group_id", "").strip()
     if not group_id:
         return False, "등록된 그룹이 없습니다. 그룹에서 /setgroup 을 먼저 실행해주세요."
 
-    start_text = event["start_at"] or "미설정"
-    end_text = event["deadline_at"] or "미설정"
     body = (
-        f"<b>{field_prefix(event,'emoji_title')}{html.escape(event['title'] or '이벤트')}</b>\n\n"
+        f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>\n"
+        f"{CARD_LINE}\n\n"
         "새 이벤트가 등록되었습니다.\n\n"
-        f"<b>{field_prefix(event,'emoji_time')}이벤트 시간</b>\n"
-        f"{html.escape(start_text)} ~ {html.escape(end_text)}\n\n"
+        f"<b>{field_prefix(event,'emoji_content')}이벤트 내용</b>\n"
+        f"{event_content_html(event)}\n\n"
+        f"<b>{field_prefix(event,'emoji_time')}진행기간</b>\n"
+        f"{html.escape(compact_event_period(event['start_at'], event['deadline_at']))}\n\n"
+        f"<b>{field_prefix(event,'emoji_conditions')}이벤트 조건</b>\n"
+        f"{event_conditions_html(event)}\n"
+        f"{CARD_LINE}\n\n"
         "설정된 시작시간에 이벤트가 자동으로 시작됩니다."
     )
+
     try:
-        await application.bot.send_message(chat_id=int(group_id), text=body, parse_mode=ParseMode.HTML)
+        representative = get_event_media(event_id)
+        first = representative[0] if representative else None
+
+        if first:
+            if first["media_type"] == "animation":
+                await application.bot.send_animation(
+                    chat_id=int(group_id),
+                    animation=first["file_id"],
+                    caption=body,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await application.bot.send_photo(
+                    chat_id=int(group_id),
+                    photo=first["file_id"],
+                    caption=body,
+                    parse_mode=ParseMode.HTML,
+                )
+        else:
+            await application.bot.send_message(
+                chat_id=int(group_id),
+                text=body,
+                parse_mode=ParseMode.HTML,
+            )
+
         return True, "등록공지를 전송했습니다."
     except Exception as exc:
         logger.exception("이벤트 등록공지 전송 실패 event_id=%s", event_id)
-        return False, str(exc)
+        return False, f"등록공지 전송 실패: {type(exc).__name__}"
 
 
 async def send_group_notice(application: Application, event_id: int, kind: str, manual=False) -> tuple[bool, str]:
@@ -2369,7 +2405,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             set_event_field(event_id, "registration_announced", 1)
 
         event = get_event(event_id)
-        suffix = "\n\n이벤트 등록을 완료했습니다."
+        suffix = "\n\n이벤트 등록이 완료되었습니다."
         suffix += "\n그룹에 이벤트 등록공지를 전송했습니다." if ok else "\n그룹 등록공지 전송 실패: " + html.escape(msg)
         await safe_edit(query, event_card(event, admin=True) + suffix, event_manage_keyboard(event), ParseMode.HTML)
         return
@@ -2929,7 +2965,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V16.3 KST BUNDLED NOTICE 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V16.4 THREE STAGE NOTICE 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
