@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V16.1 EXPIRED AUTO OFF
+# 신사 이벤트 참여봇 V16.2 REGISTRATION NOTICE
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -167,6 +167,7 @@ def init_db() -> None:
                 start_notice_delete_at TEXT NOT NULL DEFAULT '',
                 end_notice_delete_at TEXT NOT NULL DEFAULT '',
                 copied_from INTEGER NOT NULL DEFAULT 0,
+                registration_announced INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'draft',
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT '',
@@ -231,6 +232,7 @@ def init_db() -> None:
             ("start_notice_delete_at", "TEXT NOT NULL DEFAULT ''"),
             ("end_notice_delete_at", "TEXT NOT NULL DEFAULT ''"),
             ("copied_from", "INTEGER NOT NULL DEFAULT 0"),
+            ("registration_announced", "INTEGER NOT NULL DEFAULT 0"),
             ("status", "TEXT NOT NULL DEFAULT 'draft'"),
             ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ("updated_at", "TEXT NOT NULL DEFAULT ''"),
@@ -779,7 +781,7 @@ def set_event_field(event_id: int, field: str, value) -> None:
         "pre_notice_message_id", "start_notice_message_id", "end_notice_message_id",
         "pre_notice_message_type", "start_notice_message_type", "end_notice_message_type",
         "manual_mode", "duplicate_policy", "max_participants", "auto_delete_minutes",
-        "start_notice_delete_at", "end_notice_delete_at", "copied_from"
+        "start_notice_delete_at", "end_notice_delete_at", "copied_from", "registration_announced"
     }
     if field not in allowed:
         raise ValueError("잘못된 이벤트 설정입니다.")
@@ -1219,6 +1221,7 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
         and event_time_window_open(event)
     )
     rows = [
+        [InlineKeyboardButton("이벤트 등록하기", callback_data=f"event_register:{event['id']}")],
         [InlineKeyboardButton("ON", callback_data=f"event_toggle:on:{event['id']}"), InlineKeyboardButton("OFF", callback_data=f"event_toggle:off:{event['id']}")],
         [InlineKeyboardButton("이벤트명", callback_data=f"edit:title:{event['id']}"), InlineKeyboardButton("이벤트 내용", callback_data=f"edit:content:{event['id']}")],
         [InlineKeyboardButton("시작시간", callback_data=f"schedule:start:{event['id']}"), InlineKeyboardButton("마감시간", callback_data=f"schedule:end:{event['id']}")],
@@ -1539,6 +1542,31 @@ async def disable_start_notice_button(application: Application, event: sqlite3.R
             logger.warning("시작공지 참여버튼 비활성화 실패 event_id=%s error=%s", event["id"], exc)
     except Exception:
         logger.exception("시작공지 참여버튼 비활성화 실패 event_id=%s", event["id"])
+
+
+async def send_registration_notice(application: Application, event_id: int) -> tuple[bool, str]:
+    event = get_event(event_id)
+    if not event:
+        return False, "이벤트를 찾을 수 없습니다."
+    group_id = get_setting("group_id", "")
+    if not group_id:
+        return False, "등록된 그룹이 없습니다. 그룹에서 /setgroup 을 먼저 실행해주세요."
+
+    start_text = event["start_at"] or "미설정"
+    end_text = event["deadline_at"] or "미설정"
+    body = (
+        f"<b>{field_prefix(event,'emoji_title')}{html.escape(event['title'] or '이벤트')}</b>\n\n"
+        "새 이벤트가 등록되었습니다.\n\n"
+        f"<b>{field_prefix(event,'emoji_time')}이벤트 시간</b>\n"
+        f"{html.escape(start_text)} ~ {html.escape(end_text)}\n\n"
+        "설정된 시작시간에 이벤트가 자동으로 시작됩니다."
+    )
+    try:
+        await application.bot.send_message(chat_id=int(group_id), text=body, parse_mode=ParseMode.HTML)
+        return True, "등록공지를 전송했습니다."
+    except Exception as exc:
+        logger.exception("이벤트 등록공지 전송 실패 event_id=%s", event_id)
+        return False, str(exc)
 
 
 async def send_group_notice(application: Application, event_id: int, kind: str, manual=False) -> tuple[bool, str]:
@@ -2269,6 +2297,43 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
         event_id = int(event_id_text); set_event_field(event_id, "auto_delete_minutes", int(minutes))
         await safe_edit(query, event_card(get_event(event_id), admin=True), event_manage_keyboard(get_event(event_id)), ParseMode.HTML); return
 
+    if data.startswith("event_register:"):
+        event_id = int(data.split(":")[1])
+        event = get_event(event_id)
+        if not event:
+            await query.answer("이벤트를 찾을 수 없습니다.", show_alert=True)
+            return
+
+        start_at = parse_kst(event["start_at"])
+        end_at = parse_kst(event["deadline_at"])
+        if not start_at or not end_at:
+            await query.answer("시작시간과 마감시간을 먼저 설정해주세요.", show_alert=True)
+            return
+        if end_at <= start_at:
+            await query.answer("마감시간은 시작시간보다 뒤여야 합니다.", show_alert=True)
+            return
+        if now_dt() >= end_at:
+            set_event_field(event_id, "manual_mode", 2)
+            end_event(event_id)
+            await query.answer("이미 마감시간이 지난 이벤트입니다. 시간을 다시 설정해주세요.", show_alert=True)
+            return
+
+        set_event_field(event_id, "manual_mode", 0)
+        set_event_field(event_id, "registration_announced", 0)
+        set_event_field(event_id, "start_announced", 0)
+        set_event_field(event_id, "end_announced", 0)
+        refresh_event_states_sync()
+
+        ok, msg = await send_registration_notice(context.application, event_id)
+        if ok:
+            set_event_field(event_id, "registration_announced", 1)
+
+        event = get_event(event_id)
+        suffix = "\n\n이벤트 등록을 완료했습니다."
+        suffix += "\n그룹에 이벤트 등록공지를 전송했습니다." if ok else "\n그룹 등록공지 전송 실패: " + html.escape(msg)
+        await safe_edit(query, event_card(event, admin=True) + suffix, event_manage_keyboard(event), ParseMode.HTML)
+        return
+
     if data.startswith("event_toggle:"):
         _, action, event_id_text = data.split(":")
         event_id = int(event_id_text)
@@ -2759,6 +2824,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 set_event_field(event_id, "pre_notice_announced", 0)
                 set_event_field(event_id, "start_announced", 0)
                 set_event_field(event_id, "end_announced", 0)
+                set_event_field(event_id, "registration_announced", 0)
             else:
                 start = parse_kst(get_event(event_id)["start_at"])
                 if start and dt <= start:
@@ -2766,6 +2832,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 set_event_field(event_id, "deadline_at", dt.strftime("%Y-%m-%d %H:%M"))
                 set_event_field(event_id, "manual_mode", 0)
                 set_event_field(event_id, "end_announced", 0)
+                set_event_field(event_id, "registration_announced", 0)
         refresh_event_states_sync()
         context.user_data.clear()
         await message.reply_text("시간을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id)))
@@ -2822,7 +2889,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V16.1 EXPIRED AUTO OFF 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V16.2 REGISTRATION NOTICE 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
