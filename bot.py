@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
 
@@ -28,7 +29,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 신사 이벤트 참여봇 V16.2 REGISTRATION NOTICE
+# 신사 이벤트 참여봇 V16.3 KST BUNDLED NOTICE
 # - 기존 V8 계열 DB 자동 보완
 # - 여러 이벤트
 # - KST 자동 시작/마감
@@ -47,7 +48,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
 DB_FILE = os.getenv("DB_FILE", os.getenv("DB_PATH", "/data/event_bot.db")).strip()
 
-KST = timezone(timedelta(hours=9))
+KST = ZoneInfo("Asia/Seoul")
 CARD_LINE = "━━━━━━━━━━━━"
 
 logging.basicConfig(
@@ -80,7 +81,12 @@ REJECT_REASONS = {
 
 
 def now_dt() -> datetime:
-    return datetime.now(KST)
+    """항상 한국 표준시(Asia/Seoul) 기준 현재시간을 반환합니다."""
+    return datetime.now(ZoneInfo("Asia/Seoul"))
+
+
+def now_kst() -> str:
+    return now_dt().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def now_kst() -> str:
@@ -493,15 +499,21 @@ def premium_button(text: str, callback_data: str, custom_emoji_id: str = "", fal
         return InlineKeyboardButton(**kwargs)
 
 
-def parse_kst(value: str) -> Optional[datetime]:
-    value = (value or "").strip()
+def parse_kst(value: str):
+    """저장된 이벤트 시간을 Asia/Seoul aware datetime으로 변환합니다."""
     if not value:
         return None
-    for fmt in ("%Y-%m-%d %H:%M", "%Y.%m.%d %H:%M", "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+    value = str(value).strip()
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y.%m.%d %H:%M:%S",
+        "%Y.%m.%d %H:%M",
+    ):
         try:
             return datetime.strptime(value, fmt).replace(tzinfo=KST)
         except ValueError:
-            pass
+            continue
     return None
 
 
@@ -1443,6 +1455,14 @@ async def _edit_or_send_notice(application: Application, group_id: int, event: s
     elif kind == "start":
         media_file_id = event["start_media_file_id"] or ""
         media_type = event["start_media_type"] or ""
+
+        # 시작공지 전용 미디어가 없으면 대표 이미지/GIF 첫 장을 사용.
+        # 이렇게 해야 이미지 + 본문 + 참여버튼이 하나의 Telegram 메시지로 묶입니다.
+        if not media_file_id:
+            representative = get_event_media(event["id"])
+            if representative:
+                media_file_id = representative[0]["file_id"]
+                media_type = representative[0]["media_type"]
     else:
         media_file_id = event["end_media_file_id"] or ""
         media_type = event["end_media_type"] or ""
@@ -1579,6 +1599,10 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
         return False, "이벤트를 찾을 수 없습니다."
 
     if kind == "start":
+        # 예약 자동공지라면 설정 시각보다 빠르게 발송되는 것을 이중 차단
+        if not manual and int(event["manual_mode"] or 0) == 0 and not can_auto_start(event, now_dt()):
+            return False, "아직 이벤트 시작시간 전입니다."
+
         text = render_event_notice(event, "start")
         link = await bot_deep_link(application, event_id)
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("이벤트 참여하기", url=link)]])
@@ -1588,8 +1612,7 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
         markup = None
 
     try:
-        if kind == "start" and not int(event["start_notice_message_id"] or 0):
-            await send_event_media(application.bot, int(group_id), event_id)
+        # 시작공지 미디어는 _edit_or_send_notice 안에서 본문/참여버튼과 한 번에 전송합니다.
         message_id = await _edit_or_send_notice(application, int(group_id), event, kind, text, markup)
     except Exception as exc:
         logger.exception("그룹 공지 처리 실패 kind=%s event_id=%s", kind, event_id)
@@ -1643,13 +1666,24 @@ async def delete_due_notice_messages(application: Application) -> None:
                 set_event_field(event["id"], f"{kind}_notice_message_id", 0)
                 set_event_field(event["id"], f"{kind}_notice_delete_at", "")
 
+def can_auto_start(event: sqlite3.Row, now=None) -> bool:
+    """설정한 시작시간 이전에는 자동 시작/시작공지가 절대 실행되지 않습니다."""
+    now = now or now_dt()
+    start_at = parse_kst(event["start_at"])
+    end_at = parse_kst(event["deadline_at"])
+    if not start_at or not end_at:
+        return False
+    return start_at <= now < end_at
+
+
 async def scheduler_loop(application: Application):
     await asyncio.sleep(2)
-    logger.info("KST 자동 이벤트 스케줄러 시작")
+    logger.info("Asia/Seoul KST 자동 이벤트 스케줄러 시작")
 
     while True:
         try:
             now = now_dt()
+
             with db_connect() as conn:
                 rows = conn.execute(
                     "SELECT * FROM events WHERE status!='deleted' ORDER BY id ASC"
@@ -1665,8 +1699,7 @@ async def scheduler_loop(application: Application):
                     start_at = parse_kst(event["start_at"])
                     end_at = parse_kst(event["deadline_at"])
 
-                    # 가장 먼저 마감시간 검사.
-                    # 시간이 지났으면 어떤 모드였든 무조건 OFF + 종료.
+                    # 마감시간 도달/경과: 무조건 OFF + 종료
                     if end_at and now >= end_at:
                         if event["status"] != "ended" or mode != 2:
                             set_event_field(event["id"], "manual_mode", 2)
@@ -1685,7 +1718,7 @@ async def scheduler_loop(application: Application):
                             )
                             if not ok:
                                 logger.warning(
-                                    "종료공지 전송 재시도 예정 event_id=%s reason=%s",
+                                    "종료공지 재시도 예정 event_id=%s reason=%s",
                                     event["id"],
                                     msg,
                                 )
@@ -1695,7 +1728,7 @@ async def scheduler_loop(application: Application):
                     if mode == 2:
                         continue
 
-                    # 수동 ON은 마감 전까지 진행
+                    # 수동 ON은 즉시 시작 상태 유지
                     if mode == 1:
                         if event["status"] != "active":
                             start_event(event["id"], manual=False)
@@ -1710,10 +1743,11 @@ async def scheduler_loop(application: Application):
                             )
                         continue
 
-                    # 예약자동
+                    # 예약자동은 시작/마감시간 필수
                     if not start_at or not end_at:
                         continue
 
+                    # 시작시간 이전에는 절대 시작 금지
                     if now < start_at:
                         if event["status"] != "scheduled":
                             with db_connect() as conn:
@@ -1731,12 +1765,18 @@ async def scheduler_loop(application: Application):
                                 conn.commit()
                         continue
 
-                    if start_at <= now < end_at:
+                    # 설정 시작시간 이상 + 마감 전일 때만 자동 시작
+                    if can_auto_start(event, now):
                         if event["status"] != "active":
                             start_event(event["id"], manual=False)
                             event = get_event(event["id"])
 
-                        if event and not int(event["start_announced"] or 0):
+                        # 실제 그룹공지 직전에도 현재 KST를 다시 검사
+                        if (
+                            event
+                            and can_auto_start(event, now_dt())
+                            and not int(event["start_announced"] or 0)
+                        ):
                             await send_group_notice(
                                 application,
                                 event["id"],
@@ -2889,7 +2929,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("신사 이벤트 참여봇 V16.2 REGISTRATION NOTICE 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
+    logger.info("신사 이벤트 참여봇 V16.3 KST BUNDLED NOTICE 실행 | ADMIN_ID=%s | DB=%s", ADMIN_ID, DB_FILE)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
