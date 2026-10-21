@@ -1188,7 +1188,6 @@ def admin_home_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("전체 신청 현황", callback_data="admin:stats")
         ],
         [InlineKeyboardButton("신청자 검색", callback_data="admin:search")],
-        [InlineKeyboardButton("이모지 설정", callback_data="admin:emoji")],
         [InlineKeyboardButton("관리자 메뉴 닫기", callback_data="admin:close")],
     ])
 
@@ -1273,7 +1272,7 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("중복 신청", callback_data=f"ops:duplicate:{event['id']}"), InlineKeyboardButton("마감 인원", callback_data=f"ops:capacity:{event['id']}")],
         [InlineKeyboardButton("공지 자동삭제", callback_data=f"ops:autodelete:{event['id']}"), InlineKeyboardButton("이벤트 복사", callback_data=f"ops:copy:{event['id']}")],
         [InlineKeyboardButton("신청자 검색", callback_data=f"ops:search:{event['id']}"), InlineKeyboardButton("신청 현황", callback_data=f"event:stats:{event['id']}")],
-        [InlineKeyboardButton("승인 대기", callback_data=f"event:pending:{event['id']}"), InlineKeyboardButton("이모지 설정", callback_data=f"emoji:menu:{event['id']}")],
+        [InlineKeyboardButton("승인 대기", callback_data=f"event:pending:{event['id']}")],
         [InlineKeyboardButton("미리보기", callback_data=f"event:preview:{event['id']}")],
     ]
     if not is_on:
@@ -1415,13 +1414,24 @@ async def send_event_media(bot, chat_id: int, event_id: int) -> int:
 
 
 async def send_event_card(bot, chat_id: int, event: sqlite3.Row, reply_markup=None, admin=False):
-    await send_event_media(bot, chat_id, event["id"])
-    await bot.send_message(
-        chat_id,
-        text=event_card(event, admin=admin),
-        parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup,
-    )
+    """대표 사진/GIF와 이벤트 내용을 하나의 캡션 메시지로 전송한다."""
+    body = event_card(event, admin=admin)
+    media = get_event_media(event["id"])
+    first = media[0] if media else None
+    # Telegram photo/animation captions allow at most 1024 characters after entity parsing.
+    if first and len(plain_from_html(body)) <= 1024:
+        try:
+            if first["media_type"] == "animation":
+                return await bot.send_animation(chat_id, animation=first["file_id"], caption=body,
+                                                parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            return await bot.send_photo(chat_id, photo=first["file_id"], caption=body,
+                                        parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        except BadRequest as exc:
+            logger.warning("미디어 캡션 전송 실패, 텍스트 방식으로 대체 event_id=%s: %s", event["id"], exc)
+    # If too long for a caption, keep the complete text and functional buttons.
+    if first:
+        await send_event_media(bot, chat_id, event["id"])
+    return await bot.send_message(chat_id, text=body, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 
 async def bot_deep_link(application: Application, event_id: int) -> str:
@@ -2146,6 +2156,11 @@ async def safe_edit(query, text_value: str, reply_markup=None, parse_mode=None) 
             except BadRequest:
                 pass
             return
+        # A photo with a caption cannot be edited into a text message.
+        if query.message and (query.message.photo or query.message.animation):
+            await query.message.delete()
+            await query.message.chat.send_message(text_value, parse_mode=parse_mode, reply_markup=reply_markup)
+            return
         raise
 
 
@@ -2168,7 +2183,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             return
         if action == "event_list":
             events = get_active_events()
-            await query.edit_message_text("<b>진행 중인 이벤트를 선택해주세요.</b>" if events else no_event_card(), parse_mode=ParseMode.HTML, reply_markup=member_event_list_keyboard(events) if events else member_no_event_keyboard())
+            await safe_edit(query, "<b>진행 중인 이벤트를 선택해주세요.</b>" if events else no_event_card(), parse_mode=ParseMode.HTML, reply_markup=member_event_list_keyboard(events) if events else member_no_event_keyboard())
             return
         if action == "event":
             event_id = int(parts[2])
