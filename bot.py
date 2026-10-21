@@ -1268,9 +1268,8 @@ def event_manage_keyboard(event: sqlite3.Row) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("시작시간", callback_data=f"schedule:start:{event['id']}"), InlineKeyboardButton("마감시간", callback_data=f"schedule:end:{event['id']}")],
         [InlineKeyboardButton("이벤트 조건", callback_data=f"edit:conditions:{event['id']}"), InlineKeyboardButton("대표 이미지/GIF", callback_data=f"media:set:{event['id']}")],
         [InlineKeyboardButton("승인 문구", callback_data=f"edit:approval:{event['id']}"), InlineKeyboardButton("거절 문구", callback_data=f"edit:rejection:{event['id']}")],
-        [InlineKeyboardButton("시작공지", callback_data=f"edit:start_notice:{event['id']}"), InlineKeyboardButton("종료공지", callback_data=f"edit:end_notice:{event['id']}")],
         [InlineKeyboardButton("중복 신청", callback_data=f"ops:duplicate:{event['id']}"), InlineKeyboardButton("마감 인원", callback_data=f"ops:capacity:{event['id']}")],
-        [InlineKeyboardButton("공지 자동삭제", callback_data=f"ops:autodelete:{event['id']}"), InlineKeyboardButton("이벤트 복사", callback_data=f"ops:copy:{event['id']}")],
+        [InlineKeyboardButton("이벤트 복사", callback_data=f"ops:copy:{event['id']}")],
         [InlineKeyboardButton("신청자 검색", callback_data=f"ops:search:{event['id']}"), InlineKeyboardButton("신청 현황", callback_data=f"event:stats:{event['id']}")],
         [InlineKeyboardButton("승인 대기", callback_data=f"event:pending:{event['id']}")],
         [InlineKeyboardButton("미리보기", callback_data=f"event:preview:{event['id']}")],
@@ -1666,6 +1665,10 @@ async def send_registration_notice(application: Application, event_id: int) -> t
 
 
 async def send_group_notice(application: Application, event_id: int, kind: str, manual=False) -> tuple[bool, str]:
+    # 시작/종료 공지는 그룹에 게시하지 않습니다.
+    if kind in ("start", "end"):
+        return True, "시작/종료 공지 비활성화"
+
     group_id = get_setting("group_id", "").strip()
     if not group_id:
         return False, "등록된 그룹이 없습니다. 그룹방에서 /setgroup 을 먼저 실행해주세요."
