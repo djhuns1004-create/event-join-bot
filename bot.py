@@ -1443,7 +1443,7 @@ async def bot_deep_link(application: Application, event_id: int) -> str:
 
 def render_event_notice(event: sqlite3.Row, kind: str) -> str:
     if kind == "start":
-        template = event["start_notice_html"] or ""
+        template = ""  # 시작공지 별도 문구 사용하지 않음
         if template:
             replacements = {
                 "{title}": f"<b>{field_prefix(event,'emoji_title')}{event_title_html(event)}</b>",
@@ -1665,9 +1665,10 @@ async def send_registration_notice(application: Application, event_id: int) -> t
 
 
 async def send_group_notice(application: Application, event_id: int, kind: str, manual=False) -> tuple[bool, str]:
-    # 시작/종료 공지는 그룹에 게시하지 않습니다.
-    if kind in ("start", "end"):
-        return True, "시작/종료 공지 비활성화"
+    # 종료 공지는 보내지 않습니다. 시작 시에는 이벤트 본문과 이미지/참여버튼만 게시합니다.
+    if kind == "end":
+        set_event_field(event_id, "end_announced", 1)
+        return True, "종료 공지 비활성화"
 
     group_id = get_setting("group_id", "").strip()
     if not group_id:
@@ -1707,7 +1708,7 @@ async def send_group_notice(application: Application, event_id: int, kind: str, 
         logger.exception("공지 고정 실패 kind=%s event_id=%s", kind, event_id)
 
     delete_minutes = int(event["auto_delete_minutes"] or 0)
-    if delete_minutes > 0 and kind in {"start", "end"}:
+    if False and delete_minutes > 0 and kind in {"start", "end"}:
         delete_at = (now_dt() + timedelta(minutes=delete_minutes)).strftime("%Y-%m-%d %H:%M:%S")
         set_event_field(event_id, "start_notice_delete_at" if kind == "start" else "end_notice_delete_at", delete_at)
 
@@ -2451,13 +2452,9 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
         set_event_field(event_id, "end_announced", 0)
         refresh_event_states_sync()
 
-        ok, msg = await send_registration_notice(context.application, event_id)
-        if ok:
-            set_event_field(event_id, "registration_announced", 1)
-
+        # 등록 시 그룹 전송 금지: 지정된 시작시간에 스케줄러가 게시합니다.
         event = get_event(event_id)
-        suffix = "\n\n이벤트 등록이 완료되었습니다."
-        suffix += "\n그룹에 이벤트 등록공지를 전송했습니다." if ok else "\n그룹 등록공지 전송 실패: " + html.escape(msg)
+        suffix = "\n\n이벤트 예약이 완료되었습니다. 시작시간에 그룹으로 자동 게시됩니다."
         await safe_edit(query, event_card(event, admin=True) + suffix, event_manage_keyboard(event), ParseMode.HTML)
         return
 
