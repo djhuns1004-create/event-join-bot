@@ -445,15 +445,19 @@ def plain_from_html(value: str) -> str:
 
 
 def message_to_html(message) -> str:
-    text = message.text or ""
-    entities = message.entities or []
+    """Telegram entities를 보존해 텍스트와 프리미엄 이모지를 함께 저장한다."""
+    raw = message.text if message.text is not None else (message.caption or "")
+    entities = message.entities if message.text is not None else message.caption_entities
     if not entities:
-        return html.escape(text)
-    # PTB의 text_html이 프리미엄 이모지까지 가장 안정적으로 보존됨
+        return html.escape(raw)
     try:
-        return message.text_html
+        rich = message.text_html if message.text is not None else message.caption_html
+        if rich is not None:
+            return rich
     except Exception:
-        return html.escape(text)
+        logger.exception("메시지 HTML 변환 실패")
+    # 실패 시 이모지 엔티티가 사라진 것처럼 저장하지 않는다.
+    raise ValueError("서식 변환에 실패했습니다. 메시지를 다시 보내주세요.")
 
 
 def extract_custom_emoji_id_from_html(value: str) -> str:
@@ -640,6 +644,29 @@ def event_submitted_count(event_id: int) -> int:
 def event_capacity_reached(event: sqlite3.Row) -> bool:
     limit = int(event["max_participants"] or 0)
     return bool(limit > 0 and event_submitted_count(event["id"]) >= limit)
+
+
+def claim_first_come_slot(application_id: int) -> tuple[bool, str]:
+    """인증 제출 완료 순간에만 정원 점유. 동시 제출도 SQLite 쓰기 잠금으로 직렬화."""
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        app = conn.execute("SELECT * FROM applications_v6 WHERE id=?", (application_id,)).fetchone()
+        if not app or app["status"] != "collecting":
+            return False, "이미 제출되었거나 취소된 신청입니다."
+        event = conn.execute("SELECT * FROM events WHERE id=?", (app["event_id"],)).fetchone()
+        if not event or not event_is_open_without_refresh(event):
+            return False, "이벤트 참여 가능 시간이 아닙니다."
+        limit = int(event["max_participants"] or 0)
+        taken = conn.execute("SELECT COUNT(*) FROM applications_v6 WHERE event_id=? AND status IN ('pending','approved','paid')", (app["event_id"],)).fetchone()[0]
+        if limit > 0 and taken >= limit:
+            return False, "선착순 인증 제출이 마감되었습니다."
+        conn.execute("UPDATE applications_v6 SET status='pending',submitted_at=?,admin_notified=0 WHERE id=? AND status='collecting'", (now_kst(), application_id))
+        conn.commit()
+        return True, ""
+
+
+def event_is_open_without_refresh(event: sqlite3.Row) -> bool:
+    return event["status"] == "active" and event_time_window_open(event)
 
 
 def duplicate_allowed(event: sqlite3.Row, user_id: int) -> tuple[bool, Optional[sqlite3.Row]]:
@@ -1034,6 +1061,9 @@ def event_card(event: sqlite3.Row, admin: bool = False) -> str:
         f"{event_conditions_html(event)}\n"
         f"{CARD_LINE}"
     )
+    limit = int(event["max_participants"] or 0)
+    if limit > 0:
+        text += f"\n\n<b>선착순 인증완료</b> : {event_submitted_count(event['id'])}/{limit}명"
     if admin:
         status = {"draft":"등록 대기","scheduled":"예약","active":"진행중","ended":"종료"}.get(event["status"], event["status"])
         mode = int(event["manual_mode"] or 0)
@@ -1046,7 +1076,7 @@ def event_card(event: sqlite3.Row, admin: bool = False) -> str:
             f"\n상태 : {status} / {mode_text}"
             f"\n신청 : {counts.get('pending',0)} 대기 · {counts.get('approved',0)} 승인 · {counts.get('paid',0)} 지급 · {counts.get('rejected',0)} 거절"
             f"\n중복 : {dup}"
-            f"\n정원 : {'무제한' if limit <= 0 else str(limit)+'명'}"
+            f"\n선착순 인증완료 : {event_submitted_count(event['id'])} / {'무제한' if limit <= 0 else str(limit)+'명'}"
             f"\n공지삭제 : {'사용안함' if delete_min <= 0 else str(delete_min)+'분 후'}"
         )
     return text
@@ -2194,8 +2224,9 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
         if not photos:
             await query.answer("인증사진을 1장 이상 등록해주세요.", show_alert=True)
             return
-        if event_capacity_reached(event):
-            await query.answer("신청 인원이 마감되었습니다.", show_alert=True)
+        claimed, reason = claim_first_come_slot(application_id)
+        if not claimed:
+            await query.answer(reason, show_alert=True)
             return
         try:
             await send_application_to_admin(context, approw, photos)
@@ -2204,7 +2235,9 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             set_application_status(application_id, "notify_failed")
             await query.message.reply_text("⚠️ 담당자에게 신청을 전달하지 못했습니다. 잠시 후 다시 신청해주세요.")
             return
-        set_application_status(application_id, "pending")
+        with db_connect() as conn:
+            conn.execute("UPDATE applications_v6 SET admin_notified=1 WHERE id=? AND status='pending'", (application_id,))
+            conn.commit()
         context.user_data.pop("collecting_application_id", None)
         event = get_event(approw["event_id"])
         if event and event_capacity_reached(event):
@@ -2574,7 +2607,7 @@ async def callback_handler_impl(update: Update, context: ContextTypes.DEFAULT_TY
             extra = "\n\n사용 가능 변수: <code>{title}</code> <code>{start_at}</code> <code>{deadline_at}</code> <code>{conditions}</code> <code>{proof_guide}</code>"
         elif field == "end_notice":
             extra = "\n\n사용 가능 변수: <code>{title}</code> <code>{deadline_at}</code>"
-        await query.edit_message_text(f"<b>{labels.get(field,field)} 수정</b>\n\n새 내용을 보내주세요. 일반/프리미엄 이모지도 사용할 수 있습니다.{extra}", parse_mode=ParseMode.HTML, reply_markup=simple_back(event_id)); return
+        await query.edit_message_text(f"<b>{labels.get(field,field)} 수정</b>\n\n새 내용을 보내주세요. 일반 글자와 프리미엄 이모지를 한 메시지에 섞어 작성할 수 있습니다. 굵게·인용 등 텔레그램 서식도 보존됩니다.{extra}", parse_mode=ParseMode.HTML, reply_markup=simple_back(event_id)); return
 
     if data.startswith("schedule:"):
         _, which, event_id_text = data.split(":")
@@ -2834,7 +2867,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await message.reply_text("0 이상의 숫자로 입력해주세요."); return
         set_event_field(event_id, "max_participants", int(value))
         context.user_data.clear()
-        await message.reply_text("마감 인원을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(event_id))); return
+        await message.reply_text("선착순 인증완료 기준 마감 인원을 저장했습니다. (0 = 무제한)", reply_markup=event_manage_keyboard(get_event(event_id))); return
 
     if context.user_data.get("application_note_id"):
         aid=int(context.user_data["application_note_id"]); value=(message.text or "").strip()
@@ -2876,7 +2909,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if context.user_data.get("edit_group_text"):
         which = context.user_data["edit_group_text"]
         value = (message.text or "").strip()
-        set_setting("group_start_text" if which == "start" else "group_end_text", "" if value == "기본" else value)
+        set_setting("group_start_text" if which == "start" else "group_end_text", "" if value == "기본" else message_to_html(message))
         context.user_data.clear(); await message.reply_text("✅ 그룹 공지 문구를 저장했습니다.", reply_markup=group_settings_keyboard()); return
 
     event_id = context.user_data.get("schedule_event_id")
@@ -2931,7 +2964,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not plain_value.strip():
             await message.reply_text("빈 내용은 저장할 수 없습니다."); return
         update_event_text(edit_event_id, field, plain_value, html_value)
-        context.user_data.clear(); await message.reply_text("✅ 수정 내용을 저장했습니다.", reply_markup=event_manage_keyboard(get_event(edit_event_id))); return
+        context.user_data.clear()
+        await message.reply_text("✅ 문구와 프리미엄 이모지를 함께 저장했습니다.", reply_markup=event_manage_keyboard(get_event(edit_event_id)))
+        try:
+            await message.reply_text("🔎 <b>저장된 문구 미리보기</b>\n\n" + html_value, parse_mode=ParseMode.HTML)
+        except Exception:
+            logger.exception("문구 미리보기 실패")
+        return
 
     reject_id = context.user_data.get("reject_custom_id")
     if reject_id:
